@@ -77,14 +77,62 @@ class ParadisoBot:
 
     def _setup_event_handlers(self):
         """Set up Discord event handlers."""
+
         @self.client.event
         async def on_ready():
             """Handle bot ready event."""
             logger.info(f'{self.client.user} has connected to Discord!')
-            
+
+            # Log server information for debugging
+            for guild in self.client.guilds:
+                logger.info(f"Connected to guild: {guild.name} (id: {guild.id})")
+
+                # Find and send a message to the #paradiso channel if it exists
+                paradiso_channel = discord.utils.get(guild.text_channels, name="paradiso")
+                if paradiso_channel:
+                    await paradiso_channel.send(
+                        "🎬 **Paradiso Bot** is now online! Use `/help` to see available commands.")
+                    logger.info(f"Sent welcome message to #paradiso channel in {guild.name}")
+
             # Sync commands
             await self.tree.sync()
             logger.info("Commands synced")
+
+        @self.client.event
+        async def on_message(message):
+            """Handle incoming messages."""
+            # Don't respond to our own messages
+            if message.author == self.client.user:
+                return
+
+            # Log message for debugging
+            logger.info(f"Message received from {message.author}: {message.content}")
+
+            # Respond to DMs or mentions
+            if isinstance(message.channel, discord.DMChannel) or self.client.user in message.mentions:
+                logger.info(f"Responding to message from {message.author}")
+
+                help_embed = discord.Embed(
+                    title="👋 Hello from Paradiso Bot!",
+                    description="I'm here to help you manage movie voting for your movie nights!",
+                    color=0x03a9f4
+                )
+
+                help_embed.add_field(
+                    name="Getting Started",
+                    value="Use `/help` to see all available commands.",
+                    inline=False
+                )
+
+                help_embed.add_field(
+                    name="Quick Commands",
+                    value="• `/add [movie title]` - Add a movie to vote on\n"
+                          "• `/vote [movie title]` - Vote for a movie\n"
+                          "• `/movies` - See all movies in the queue",
+                    inline=False
+                )
+
+                await message.channel.send(embed=help_embed)
 
     def _register_commands(self):
         """Register Discord slash commands."""
@@ -98,7 +146,13 @@ class ParadisoBot:
 
     def run(self):
         """Run the Discord bot."""
-        self.client.run(self.discord_token)
+        try:
+            logger.info("Starting Paradiso bot...")
+            self.client.run(self.discord_token)
+        except discord.errors.LoginFailure:
+            logger.error("Invalid Discord token. Please check your DISCORD_TOKEN environment variable.")
+        except Exception as e:
+            logger.error(f"Error running the bot: {e}")
 
     # Command handlers
     async def cmd_add(self, interaction: discord.Interaction, title: str):
@@ -674,6 +728,9 @@ def main():
         exit(1)
     
     keep_alive()
+    
+    logger.info(f"Starting with token: {discord_token[:5]}...{discord_token[-5:]}")
+    logger.info(f"Using Algolia app ID: {algolia_app_id}")
 
     # Create and run the bot
     bot = ParadisoBot(
