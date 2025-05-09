@@ -40,6 +40,7 @@ import hashlib
 from typing import List, Dict, Any, Optional, Union, Tuple
 
 import discord
+from algoliasearch.recommend_client import RecommendClient
 from discord import app_commands
 from discord.ui import Modal # Only Modal needed here for the class reference
 from dotenv import load_dotenv
@@ -110,6 +111,7 @@ class ParadisoBot:
 
         # Initialize Algolia client (no more index objects)
         self.algolia_client = SearchClient.create(algolia_app_id, algolia_api_key)
+        self.recommend_client = RecommendClient.create(algolia_app_id, algolia_api_key)
 
         # Set up event handlers using decorators
         self._setup_event_handlers()
@@ -262,6 +264,17 @@ class ParadisoBot:
             await interaction.response.send_modal(MovieAddModal(self, movie_title=title or ""))
             # The modal's on_submit handles the followup response.
 
+        @self.tree.command(name="recommend", description="Get movie recommendations based on a movie you like")
+        @app_commands.describe(
+            movie_title="Title of the movie you want recommendations for",
+            model="Recommendation model (related or similar)"
+        )
+        @app_commands.choices(model=[
+            app_commands.Choice(name="Related by attributes", value="related"),
+            app_commands.Choice(name="Visually similar", value="similar")
+        ])
+        async def cmd_recommend(interaction: discord.Interaction, movie_title: str, model: str = "related"):
+            await self.cmd_recommend(interaction, movie_title, model)
 
         self.tree.command(name="vote", description="Vote for a movie in the queue")(self.cmd_vote)
         self.tree.command(name="movies", description="List all movies in the voting queue")(self.cmd_movies)
@@ -269,7 +282,7 @@ class ParadisoBot:
         self.tree.command(name="related", description="Find related movies based on a movie in the database")(self.cmd_related)
         self.tree.command(name="top", description="Show the top voted movies")(self.cmd_top)
         self.tree.command(name="info", description="Get detailed info for a movie")(self.cmd_info)
-        self.tree.command(name="help", description="Show help for Paradiso commands")(self.cmd_help)
+        # self.tree.command(name="help", description="Show help for Paradiso commands")(self.cmd_help)
 
 
     def run(self):
@@ -1164,6 +1177,121 @@ class ParadisoBot:
         except Exception as e:
             logger.error(f"Error in /related command: {e}", exc_info=True)
             await interaction.followup.send(f"❌ An error occurred while finding related movies: {str(e)}")
+
+    async def cmd_recommend(self, interaction: discord.Interaction, movie_title: str, model: str = "related"):
+        """Get movie recommendations using Algolia Recommend API.
+
+        Args:
+            interaction: interaction API.
+            movie_title: Title of the reference movie
+            model: Recommendation model to use (related or similar)
+        """
+        await interaction.response.defer(thinking=True)
+
+        try:
+            # Find the reference movie
+            reference_movie = await find_movie_by_title(self.algolia_client, self.algolia_movies_index_name,
+                                                        movie_title)
+
+            if not reference_movie:
+                await interaction.followup.send(
+                    f"Could not find a movie matching '{movie_title}' to find recommendations.")
+                return
+
+            # Set up recommendations params
+            recommend_params = {
+                "indexName": self.algolia_movies_index_name,
+                "threshold": 0,  # Return all recommendations
+                "maxRecommendations": 5  # Limit to 5 recommendations
+            }
+
+            if model.lower() == "similar":
+                # Visual similarity recommendations (if image exists)
+                if not reference_movie.get("image"):
+                    await interaction.followup.send(
+                        f"Movie '{reference_movie['title']}' doesn't have an image for visual similarity search.")
+                    return
+
+                # Use "Looking Similar" model with image URL
+                recommendations = self.recommend_client.get_looking_similar_objects({
+                    **recommend_params,
+                    "objectID": reference_movie["objectID"]
+                })
+            else:
+                # Use "Related Products" model for semantic relationship
+                recommendations = self.recommend_client.get_related_products({
+                    **recommend_params,
+                    "objectID": reference_movie["objectID"]
+                })
+
+            # Create embed for results
+            embed = discord.Embed(
+                title=f"🎬 Recommended Movies Based on '{reference_movie.get('title', 'Unknown')}'",
+                description=f"Here are movies you might enjoy if you liked this one:",
+                color=0x03a9f4
+            )
+
+            # Add reference movie details
+            ref_year = f" ({reference_movie.get('year')})" if reference_movie.get('year') is not None else ""
+            ref_genre = ", ".join(reference_movie.get("genre", [])) or "N/A"
+            ref_director = reference_movie.get("director", "Unknown")
+            ref_rating = reference_movie.get("rating")
+
+            embed.add_field(
+                name=f"📌 Reference Movie: {reference_movie.get('title', 'Unknown')}{ref_year}",
+                value=f"**Genre**: {ref_genre}\n"
+                      f"**Director**: {ref_director}\n"
+                      f"**Rating**: ⭐ {ref_rating}/10" if ref_rating is not None else "Rating: N/A\n"
+                                                                                      f"**Votes**: {reference_movie.get('votes', 0)}",
+                inline=False
+            )
+
+            # Add separator
+            embed.add_field(name="Recommended Movies", value="─────────────", inline=False)
+
+            # Process recommendations
+            hits = recommendations.get("results", [])
+            if not hits:
+                embed.add_field(
+                    name="No Recommendations Found",
+                    value="Could not find any similar movies in the database.",
+                    inline=False
+                )
+            else:
+                for i, hit in enumerate(hits):
+                    title = hit.get("title", "Unknown")
+                    year = f" ({hit.get('year')})" if hit.get('year') is not None else ""
+                    votes = hit.get("votes", 0)
+                    rating = hit.get("rating")
+
+                    movie_details = [
+                        f"**Votes**: {votes}",
+                        f"**Year**: {hit.get('year', 'N/A')}",
+                        f"**Rating**: ⭐ {rating}/10" if rating is not None else "Rating: N/A",
+                    ]
+
+                    if hit.get("genre"):
+                        movie_details.append(f"**Genre**: {', '.join(hit.get('genre', []))}")
+
+                    embed.add_field(
+                        name=f"{i + 1}. {title}{year}",
+                        value="\n".join(movie_details) or "Details not available.",
+                        inline=False
+                    )
+
+            # Set thumbnail from reference movie
+            if reference_movie.get("image"):
+                embed.set_thumbnail(url=reference_movie["image"])
+
+            # Set footer based on model
+            model_name = "visual similarity" if model.lower() == "similar" else "content relationships"
+            embed.set_footer(text=f"Recommendations based on {model_name}. Use /vote to vote!")
+
+            await interaction.followup.send(embed=embed)
+
+        except Exception as e:
+            logger.error(f"Error in /recommend command: {e}", exc_info=True)
+            await interaction.followup.send(f"❌ An error occurred while finding recommendations: {str(e)}")
 
     async def cmd_top(self, interaction: discord.Interaction, count: int = 5):
         """Show the top voted movies."""
