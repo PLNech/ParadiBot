@@ -1,0 +1,3 @@
+# Create a .replit file for configuration
+language = "python3"
+run = "python paradiso_bot.py"
