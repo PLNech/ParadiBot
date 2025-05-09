@@ -1979,6 +1979,68 @@ class ParadisoBot:
              logger.error(f"Error in /info command: {e}", exc_info=True)
              await interaction.followup.send(f"❌ An error occurred while fetching movie info: {str(e)}")
 
+    async def cmd_help(self, interaction: discord.Interaction):
+        """Show help for Paradiso commands."""
+        embed = discord.Embed(
+            title="Paradiso Bot Help",
+            description="Here are the commands you can use with the Paradiso movie voting bot:",
+            color=0x03a9f4
+        )
+
+        commands = [
+            {
+                "name": "/add [title]",
+                "description": "Add a movie to the voting queue using a pop-up form (Recommended!)"
+            },
+            {
+                "name": "/vote [title]",
+                "description": "Vote for a movie in the queue (handles ambiguous titles via buttons)"
+            },
+             {
+                "name": "/movies",
+                "description": "List all movies in the voting queue (paginated list)"
+            },
+            {
+                "name": "/search [query]",
+                "description": "Search for movies by title, actor, director, year, etc."
+            },
+            {
+                "name": "/related [query]",
+                "description": "Find movies related to a movie in the database (based on genre, director, actors)"
+            },
+            {
+                "name": "/top [count]",
+                "description": "Show the top voted movies (default: top 5, max: 20)"
+            },
+            {
+                "name": "/info [query]",
+                "description": "Get detailed info for a movie" # New help text
+            },
+             {
+                "name": "/help",
+                "description": "Show this help message"
+            }
+        ]
+
+        for cmd in commands:
+            embed.add_field(name=cmd["name"], value=cmd["description"], inline=False)
+
+        embed.add_field(
+             name="Search Filters (for /search and /related)",
+             value="You can filter searches using `key:value`. Examples:\n"
+                   "`/search matrix year:1999`\n"
+                   "`/search action genre:Comedy director:Nolan`\n"
+                   "`/search year>2010 votes:>5`\n"
+                   "Use quotes for multi-word values: `/search actor:\"Tom Hanks\"`\n"
+                   "Supported keys: `year`, `director`, `actor`, `genre`, `votes`, `rating`.",
+             inline=False
+        )
+
+
+        embed.set_footer(text="Happy voting! 🎬")
+
+        await interaction.response.send_message(embed=embed)
+
     async def _send_detailed_movie_embed(self, target: Union[discord.TextChannel, discord.DMChannel, discord.Webhook], movie: Dict[str, Any]):
         """Helper to send a detailed embed for a single movie."""
         title = movie.get('title', 'Unknown Movie')
