@@ -26,6 +26,8 @@ from dotenv import load_dotenv
 import requests
 from algoliasearch.search_client import SearchClient
 
+from keep_alive import keep_alive
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -671,6 +673,8 @@ def main():
         logger.error("Missing required environment variables. Please check your .env file.")
         exit(1)
     
+    keep_alive()
+
     # Create and run the bot
     bot = ParadisoBot(
         discord_token=discord_token,
