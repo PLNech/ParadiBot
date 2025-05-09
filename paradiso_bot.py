@@ -757,3 +757,43 @@ class ParadisoBot:
         except Exception as e:
             logger.error(f"Error in /search command: {e}")
             await interaction.followup.send(f"An error occurred during search: {str(e)}")
+
+
+def main():
+    """Run the bot."""
+    # Load environment variables
+    load_dotenv()
+    discord_token = os.getenv('DISCORD_TOKEN')
+    algolia_app_id = os.getenv('ALGOLIA_APP_ID')
+    algolia_api_key = os.getenv('ALGOLIA_API_KEY')
+    algolia_movies_index = os.getenv('ALGOLIA_MOVIES_INDEX')
+    algolia_votes_index = os.getenv('ALGOLIA_VOTES_INDEX')
+
+    # Check if all environment variables are set
+    if not all([discord_token, algolia_app_id, algolia_api_key,
+                algolia_movies_index, algolia_votes_index]):
+        logger.error("Missing required environment variables. Please check your .env file.")
+        exit(1)
+
+    # Log configuration details (with secrets partially masked)
+    logger.info(
+        f"Starting with token: {discord_token[:5]}...{discord_token[-5:] if len(discord_token) > 10 else '****'}")
+    logger.info(f"Using Algolia app ID: {algolia_app_id}")
+    logger.info(f"Using Algolia indices: {algolia_movies_index}, {algolia_votes_index}")
+
+    # Start keep-alive web server
+    keep_alive()
+
+    # Create and run the bot
+    bot = ParadisoBot(
+        discord_token=discord_token,
+        algolia_app_id=algolia_app_id,
+        algolia_api_key=algolia_api_key,
+        algolia_movies_index=algolia_movies_index,
+        algolia_votes_index=algolia_votes_index
+    )
+    bot.run()
+
+
+if __name__ == "__main__":
+    main()
