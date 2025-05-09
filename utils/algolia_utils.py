@@ -5,6 +5,8 @@ import logging
 from typing import List, Dict, Any, Optional, Union, Tuple
 
 from algoliasearch.search.client import SearchClient
+from algoliasearch.search.models.search_response import SearchResponse
+from algoliasearch.search.models.search_responses import SearchResponses
 
 logger = logging.getLogger("paradiso_bot")
 
@@ -270,11 +272,11 @@ async def search_movies_for_vote(client: SearchClient, index_name: str, title: s
             ]
         }
 
-        search_response = await client.search(search_params)
-        search_result = search_response.results[0]  # Get first result
+        search_response: SearchResponses = await client.search(search_params)
+        search_result : SearchResponse = search_response.results[0]  # Get first result
 
-        logger.info(f"Vote search for '{title}' found {search_result['nbHits']} hits.")
-        return search_result.model_dump() # TODO now it's typed leverage SearchResult directly :)
+        logger.info(f"Vote search for '{title}' found {search_result.nbHits} hits.")
+        return search_result.hits[0].model_dump()
 
     except Exception as e:
         logger.error(f"Error searching for movies for vote '{title}' in Algolia: {e}", exc_info=True)
@@ -318,7 +320,7 @@ async def get_all_movies(client: SearchClient, index_name: str) -> List[Dict[str
     """Get all movies from Algolia movies index."""
     try:
         browsed = await client.browse(index_name)
-        all_movies = [h.__dict for h in browsed.hits]
+        all_movies = [h.__dict__ for h in browsed.hits]
 
         logger.info(f"Fetched {len(all_movies)} movies from Algolia using browse.")
         all_movies.sort(key=lambda m: (m.get("votes", 0), m.get("title", "")), reverse=True)
