@@ -6,3 +6,7 @@ channel = "stable-24_05"
 
 [deployment]
 run = ["sh", "-c", "python paradiso_bot.py"]
+
+[[ports]]
+localPort = 8080
+externalPort = 80
