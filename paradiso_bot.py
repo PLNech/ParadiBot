@@ -40,11 +40,11 @@ import hashlib
 from typing import List, Dict, Any, Optional, Union, Tuple
 
 import discord
-from algoliasearch.recommend_client import RecommendClient
+from algoliasearch.recommend.client import RecommendClient
 from discord import app_commands
 from discord.ui import Modal # Only Modal needed here for the class reference
 from dotenv import load_dotenv
-from algoliasearch.search_client import SearchClient # Algolia client initialized here
+from algoliasearch.search.client import SearchClient # Algolia client initialized here
 
 # Import utilities
 from utils.algolia_utils import (
@@ -93,13 +93,16 @@ class ParadisoBot:
         self.algolia_actors_index_name = algolia_actors_index
 
         # Track users in movie-adding flow (for text-based DM flow)
-        self.add_movie_flows = {} # Dict to store user_id: flow_state (for DM text flow)
+        self.add_movie_flows = {}  # Dict to store user_id: flow_state (for DM text flow)
 
         # Track vote selection messages (using buttons)
-        self.vote_messages = {} # Dict to store message_id: {'user_id': ..., 'choices': [...]}
+        self.vote_messages = {}  # Dict to store message_id: {'user_id': ..., 'choices': [...]}
+
+        # Track pending vote selections in text flow
+        self.pending_votes = {}  # Dict to store user_id: {'channel': ..., 'choices': [...], 'timestamp': ...}
 
         # Track movies pagination messages
-        self.movies_pagination_state = {} # Dict message_id: {'user_id': ..., 'all_movies': [...], 'current_page': ..., 'movies_per_page': ..., 'detailed_count': ...}
+        self.movies_pagination_state = {}  # Dict message_id: {'user_id': ..., 'all_movies': [...], 'current_page': ..., 'movies_per_page': ..., 'detailed_count': ...}
 
 
         # Initialize Discord client
@@ -110,8 +113,8 @@ class ParadisoBot:
         self.tree = app_commands.CommandTree(self.client)
 
         # Initialize Algolia client (no more index objects)
-        self.algolia_client = SearchClient.create(algolia_app_id, algolia_api_key)
-        self.recommend_client = RecommendClient.create(algolia_app_id, algolia_api_key)
+        self.algolia_client = SearchClient(algolia_app_id, algolia_api_key)
+        self.recommend_client = RecommendClient(algolia_app_id, algolia_api_key)
 
         # Set up event handlers using decorators
         self._setup_event_handlers()
@@ -138,7 +141,8 @@ class ParadisoBot:
                         messages = [msg async for msg in paradiso_channel.history(limit=5)]
                         last_bot_message = next((msg for msg in messages if msg.author == self.client.user), None)
 
-                        if last_bot_message and (datetime.datetime.utcnow() - last_bot_message.created_at.replace(tzinfo=datetime.timezone.utc)).total_seconds() < 60:
+                        if last_bot_message and (datetime.datetime.now(
+                                datetime.timezone.utc) - last_bot_message.created_at).total_seconds() < 60:
                              logger.info("Skipping welcome message to avoid spam.")
                         else:
                              await paradiso_channel.send(
@@ -165,7 +169,8 @@ class ParadisoBot:
         @self.client.event
         async def on_message(message):
             """Handle incoming messages for text commands or add movie flow."""
-            if message.author == self.client.user or message.is_command():
+            if message.author == self.client.user or (
+                    hasattr(message, 'type') and message.type == discord.MessageType.application_command):
                 return
 
             logger.info(f"Message received from {message.author} ({message.author.id}) in {message.channel}: {message.content}")
@@ -282,7 +287,7 @@ class ParadisoBot:
         self.tree.command(name="related", description="Find related movies based on a movie in the database")(self.cmd_related)
         self.tree.command(name="top", description="Show the top voted movies")(self.cmd_top)
         self.tree.command(name="info", description="Get detailed info for a movie")(self.cmd_info)
-        # self.tree.command(name="help", description="Show help for Paradiso commands")(self.cmd_help)
+        self.tree.command(name="help", description="Show help for Paradiso commands")(self.cmd_help)
 
 
     def run(self):
@@ -1182,7 +1187,6 @@ class ParadisoBot:
         """Get movie recommendations using Algolia Recommend API.
 
         Args:
-            interaction: interaction API.
             movie_title: Title of the reference movie
             model: Recommendation model to use (related or similar)
         """
@@ -1198,31 +1202,37 @@ class ParadisoBot:
                     f"Could not find a movie matching '{movie_title}' to find recommendations.")
                 return
 
-            # Set up recommendations params
-            recommend_params = {
-                "indexName": self.algolia_movies_index_name,
-                "threshold": 0,  # Return all recommendations
-                "maxRecommendations": 5  # Limit to 5 recommendations
+            # Prepare the request based on selected model
+            if model.lower() == "similar" and reference_movie.get("image"):
+                # LookingSimilar model requires an image
+                request = {
+                    "model": "looking-similar",
+                    "index_name": self.algolia_movies_index_name,
+                    "threshold": 0,
+                    "max_recommendations": 5,
+                    "object_id": reference_movie["objectID"]
+                }
+            else:
+                # Default to RelatedProducts model
+                request = {
+                    "model": "related-products",
+                    "index_name": self.algolia_movies_index_name,
+                    "threshold": 0,
+                    "max_recommendations": 5,
+                    "object_id": reference_movie["objectID"],
+                    "fallback_parameters": {
+                        "query": "",
+                        "filters": f"NOT objectID:{reference_movie['objectID']}"
+                    }
+                }
+
+            # Create the GetRecommendationsParams object with the request
+            params = {
+                "requests": [request]
             }
 
-            if model.lower() == "similar":
-                # Visual similarity recommendations (if image exists)
-                if not reference_movie.get("image"):
-                    await interaction.followup.send(
-                        f"Movie '{reference_movie['title']}' doesn't have an image for visual similarity search.")
-                    return
-
-                # Use "Looking Similar" model with image URL
-                recommendations = self.recommend_client.get_looking_similar_objects({
-                    **recommend_params,
-                    "objectID": reference_movie["objectID"]
-                })
-            else:
-                # Use "Related Products" model for semantic relationship
-                recommendations = self.recommend_client.get_related_products({
-                    **recommend_params,
-                    "objectID": reference_movie["objectID"]
-                })
+            # Call the recommend API
+            response = await self.algolia_client.recommend.get_recommendations(params)
 
             # Create embed for results
             embed = discord.Embed(
@@ -1249,8 +1259,10 @@ class ParadisoBot:
             # Add separator
             embed.add_field(name="Recommended Movies", value="─────────────", inline=False)
 
-            # Process recommendations
-            hits = recommendations.get("results", [])
+            # Process recommendations - unwrap from the response structure
+            results = response.results[0] if response.results else None
+            hits = results.hits if results else []
+
             if not hits:
                 embed.add_field(
                     name="No Recommendations Found",
@@ -1292,6 +1304,8 @@ class ParadisoBot:
         except Exception as e:
             logger.error(f"Error in /recommend command: {e}", exc_info=True)
             await interaction.followup.send(f"❌ An error occurred while finding recommendations: {str(e)}")
+            # For debugging in production, add more detailed error information
+            logger.debug(f"Detailed error in recommend command: {e}", exc_info=True)
 
     async def cmd_top(self, interaction: discord.Interaction, count: int = 5):
         """Show the top voted movies."""
@@ -1350,6 +1364,56 @@ class ParadisoBot:
              logger.error(f"Error in /info command: {e}", exc_info=True)
              await interaction.followup.send(f"❌ An error occurred while fetching movie info: {str(e)}")
 
+    async def cmd_help(self, interaction: discord.Interaction):
+        """Show help for Paradiso commands."""
+        embed = discord.Embed(
+            title="👋 Paradiso Bot Help",
+            description="Your movie night companion for voting and recommendations!",
+            color=0x03a9f4
+        )
+
+        # Basic Commands
+        embed.add_field(
+            name="Basic Commands",
+            value="`/add [title]` - Add a movie using a form\n"
+                  "`/vote [title]` - Vote for a movie\n"
+                  "`/movies` - See all movies (paginated)\n"
+                  "`/top [count]` - Show top voted movies",
+            inline=False
+        )
+
+        # Search Commands
+        embed.add_field(
+            name="Search & Discover",
+            value="`/search [query]` - Search with filters\n"
+                  "`/info [query]` - Get detailed movie info\n"
+                  "`/related [query]` - Find related movies\n"
+                  "`/recommend [title]` - Get AI-powered recommendations",
+            inline=False
+        )
+
+        # Search Filters
+        embed.add_field(
+            name="Search Filters (for /search)",
+            value="Filter with `key:value` or `key>value`. Examples:\n"
+                  "`/search action genre:Comedy director:Nolan`\n"
+                  "`/search year>2010 rating:>8`\n"
+                  "Supported keys: `year`, `director`, `actor`, `genre`, `votes`, `rating`",
+            inline=False
+        )
+
+        # Command usage notes
+        embed.add_field(
+            name="Usage Notes",
+            value="- Use `/add` with no title to open an empty form\n"
+                  "- Use `/vote` to vote for your favorite movies\n"
+                  "- Try `/recommend` to discover movies similar to your favorites\n"
+                  "- Use `/related` to find movies with similar attributes",
+            inline=False
+        )
+
+        embed.set_footer(text="Happy movie nights! 🎬")
+        await interaction.response.send_message(embed=embed)
 
 def main():
     """Run the bot."""
