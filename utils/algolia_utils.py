@@ -6,9 +6,6 @@ from typing import List, Dict, Any, Optional, Union, Tuple
 
 from algoliasearch.search.client import SearchClient
 
-# For browse_objects, the specific response type might not be explicitly needed for simple iteration
-# from algoliasearch.search.models.browse_response import BrowseResponse # Not strictly necessary for current usage
-
 logger = logging.getLogger("paradiso_bot")
 
 
@@ -39,40 +36,40 @@ async def _check_movie_exists(client: SearchClient, index_name: str, title: str)
     if not title:
         return None
     try:
-        search_params_payload = {
-            "requests": [
-                {
-                    "indexName": index_name,
-                    "query": title,
-                    "params": {
-                        "hitsPerPage": 5,
-                        "attributesToRetrieve": ["objectID", "title"],
-                        "attributesToHighlight": ["title"],
-                        "typoTolerance": "strict"
+        # Fixed: Use correct v4 API payload structure
+        search_response = await client.search(
+            search_method_params={
+                "requests": [
+                    {
+                        "indexName": index_name,
+                        "query": title,
+                        "params": {
+                            "hitsPerPage": 5,
+                            "attributesToRetrieve": ["objectID", "title"],
+                            "attributesToHighlight": ["title"],
+                            "typoTolerance": "strict"
+                        }
                     }
-                }
-            ]
-        }
+                ]
+            }
+        )
 
-        search_response = await client.search(search_method_params=search_params_payload)
-        # For multi-search, results is a list. We expect one result here.
-        if not search_response.results or len(search_response.results) == 0:
-            logger.warning(f"No results array from Algolia for _check_movie_exists with title '{title}'")
+        if not search_response or not hasattr(search_response, 'results') or len(search_response.results) == 0:
+            logger.warning(f"No results from Algolia for _check_movie_exists with title '{title}'")
             return None
 
         search_result = search_response.results[0]
-
-        if search_result.nb_hits == 0:  # nb_hits in v4
+        if search_result.nb_hits == 0:
             return None
 
-        for hit in search_result.hits:  # hits is a list of dicts
+        for hit in search_result.hits:
             title_highlight = hit.get("_highlightResult", {}).get("title", {})
             if title_highlight.get('matchLevel') == 'full':
                 logger.info(f"Existing movie check: Found full title match for '{title}': {hit['objectID']}")
-                return hit.model_dump()
+                return hit
             if hit.get("title", "").lower() == title.lower():
                 logger.info(f"Existing movie check: Found exact string match for '{title}': {hit['objectID']}")
-                return hit.model_dump()
+                return hit
 
         logger.info(f"Existing movie check: No strong title match for '{title}' among top hits.")
         return None
@@ -85,9 +82,29 @@ async def _check_movie_exists(client: SearchClient, index_name: str, title: str)
 async def add_movie_to_algolia(client: SearchClient, index_name: str, movie_data: Dict[str, Any]) -> None:
     """Add a movie to Algolia movies index."""
     try:
+        # Ensure the data has required fields for your schema
+        processed_data = {
+            "objectID": movie_data.get("objectID", f"manual_{int(time.time())}_{random.randint(0, 999)}"),
+            "title": movie_data.get("title", "Unknown Movie"),
+            "originalTitle": movie_data.get("originalTitle", movie_data.get("title", "Unknown Movie")),
+            "year": movie_data.get("year"),
+            "director": movie_data.get("director", "Unknown"),
+            "actors": movie_data.get("actors", []) if isinstance(movie_data.get("actors"), list) else [],
+            "genre": movie_data.get("genre", []) if isinstance(movie_data.get("genre"), list) else [],
+            "plot": movie_data.get("plot", "No plot available."),
+            "image": movie_data.get("image"),
+            "rating": movie_data.get("rating"),
+            "imdbID": movie_data.get("imdbID"),
+            "tmdbID": movie_data.get("tmdbID"),
+            "source": movie_data.get("source", "manual"),
+            "votes": movie_data.get("votes", 0),
+            "addedDate": movie_data.get("addedDate", int(time.time())),
+            "addedBy": movie_data.get("addedBy", "")
+        }
+
         # V4 API: save_object with index_name as first arg, then body
-        await client.save_object(index_name=index_name, body=movie_data)
-        logger.info(f"Added movie to Algolia: {movie_data.get('title')} ({movie_data.get('objectID')})")
+        await client.save_object(index_name=index_name, body=processed_data)
+        logger.info(f"Added movie to Algolia: {processed_data.get('title')} ({processed_data.get('objectID')})")
     except Exception as e:
         logger.error(f"Error adding movie to Algolia: {e}", exc_info=True)
         raise  # Re-raise the exception
@@ -100,26 +117,25 @@ async def vote_for_movie(client: SearchClient, movies_index_name: str, votes_ind
         user_token = generate_user_token(user_id)
 
         # Check if user already voted for this movie using the votes index
-        search_params_payload = {
-            "requests": [
-                {
-                    "indexName": votes_index_name,
-                    "query": "",
-                    "params": {
-                        "filters": f"userToken:'{user_token}' AND movieId:'{movie_id}'"
-                        # Ensure strings are quoted for filters
+        search_response = await client.search(
+            search_method_params={
+                "requests": [
+                    {
+                        "indexName": votes_index_name,
+                        "query": "",
+                        "params": {
+                            "filters": f"userToken:'{user_token}' AND movieId:'{movie_id}'"
+                        }
                     }
-                }
-            ]
-        }
+                ]
+            }
+        )
 
-        search_response = await client.search(search_method_params=search_params_payload)
-        if not search_response.results or len(search_response.results) == 0:
+        if not search_response or not hasattr(search_response, 'results') or len(search_response.results) == 0:
             logger.error(f"No results array from Algolia for vote check for movie {movie_id}, user {user_id}")
             return False, "Error checking existing vote"
 
         search_result = search_response.results[0]
-
         if search_result.nb_hits > 0:
             logger.info(f"User {user_id} ({user_token[:8]}...) already voted for movie {movie_id}.")
             existing_movie = await get_movie_by_id(client, movies_index_name, movie_id)
@@ -137,7 +153,6 @@ async def vote_for_movie(client: SearchClient, movies_index_name: str, votes_ind
         logger.info(f"Recorded vote for movie {movie_id} by user {user_id}.")
 
         # Increment the movie's vote count in the movies index
-        # In V4, partial_update_object takes attributes_to_update as the body
         attributes_to_update_payload = {
             "votes": {
                 "_operation": "Increment",
@@ -149,8 +164,8 @@ async def vote_for_movie(client: SearchClient, movies_index_name: str, votes_ind
         update_result = await client.partial_update_object(
             index_name=movies_index_name,
             object_id=movie_id,
-            attributes_to_update=attributes_to_update_payload,  # This is the body
-            create_if_not_exists=False  # This is a specific parameter for this method
+            attributes_to_update=attributes_to_update_payload,
+            create_if_not_exists=False
         )
 
         # Wait for the task to complete
@@ -174,29 +189,24 @@ async def vote_for_movie(client: SearchClient, movies_index_name: str, votes_ind
             logger.error(
                 f"Vote recorded for {movie_id}, but failed to fetch updated movie object after waiting. Attempting fallback.",
                 exc_info=True)
-            # Fallback: This logic can remain similar, but ensure get_movie_by_id is robust
             try:
-                # Attempt to fetch again, in case of transient issue
                 movie_before_vote_again = await get_movie_by_id(client, movies_index_name, movie_id)
                 if movie_before_vote_again:
-                    fallback_votes = movie_before_vote_again.get('votes',
-                                                                 0)  # Assume increment happened if task was sent
+                    fallback_votes = movie_before_vote_again.get('votes', 0)
                     fallback_title = movie_before_vote_again.get('title', 'Unknown Movie')
                     fallback_image = movie_before_vote_again.get('image')
                     logger.warning(
                         f"Returning fallback info for movie {movie_id} vote confirmation using re-fetched data.")
                     return True, {"objectID": movie_id, "votes": fallback_votes, 'title': fallback_title,
                                   'image': fallback_image}
-                else:  # if still cannot fetch, use a placeholder
+                else:
                     logger.error(f"Failed to fetch movie {movie_id} even with fallback re-fetch.", exc_info=True)
                     return True, {"objectID": movie_id, "votes": 'Unknown (increment sent)', 'title': 'Unknown Movie',
                                   'image': None}
-
             except Exception:
                 logger.error(f"Exception in fallback for movie {movie_id}.", exc_info=True)
                 return True, {"objectID": movie_id, "votes": 'Unknown (increment sent)', 'title': 'Unknown Movie',
                               'image': None}
-
 
     except Exception as e:
         logger.error(f"FATAL error voting for movie {movie_id} by user {user_id}: {e}", exc_info=True)
@@ -208,7 +218,6 @@ async def get_movie_by_id(client: SearchClient, index_name: str, movie_id: str) 
     try:
         # V4 API: get_object takes index_name and object_id
         response_obj = await client.get_object(index_name=index_name, object_id=movie_id)
-        # The response_obj itself is the movie dictionary in v4
         return response_obj
     except Exception as e:
         # Check for specific "object not found"
@@ -228,32 +237,32 @@ async def find_movie_by_title(client: SearchClient, index_name: str, title: str)
     if not title:
         return None
     try:
-        search_params_payload = {
-            "requests": [
-                {
-                    "indexName": index_name,
-                    "query": title,
-                    "params": {
-                        "hitsPerPage": 5,
-                        "attributesToRetrieve": [
-                            "objectID", "title", "originalTitle", "year", "director",
-                            "actors", "genre", "plot", "image", "votes", "rating",
-                            "imdbID", "tmdbID"
-                        ],
-                        "attributesToHighlight": ["title", "originalTitle"],
-                        "typoTolerance": "strict"  # strict typo tolerance
+        search_response = await client.search(
+            search_method_params={
+                "requests": [
+                    {
+                        "indexName": index_name,
+                        "query": title,
+                        "params": {
+                            "hitsPerPage": 5,
+                            "attributesToRetrieve": [
+                                "objectID", "title", "originalTitle", "year", "director",
+                                "actors", "genre", "plot", "image", "votes", "rating",
+                                "imdbID", "tmdbID"
+                            ],
+                            "attributesToHighlight": ["title", "originalTitle"],
+                            "typoTolerance": "strict"
+                        }
                     }
-                }
-            ]
-        }
+                ]
+            }
+        )
 
-        search_response = await client.search(search_method_params=search_params_payload)
-        if not search_response.results or len(search_response.results) == 0:
-            logger.warning(f"No results array from Algolia for find_movie_by_title with title '{title}'")
+        if not search_response or not hasattr(search_response, 'results') or len(search_response.results) == 0:
+            logger.warning(f"No results from Algolia for find_movie_by_title with title '{title}'")
             return None
 
         search_result = search_response.results[0]
-
         if search_result.nb_hits == 0:
             return None
 
@@ -266,7 +275,7 @@ async def find_movie_by_title(client: SearchClient, index_name: str, title: str)
             if title_highlight.get('matchLevel') == 'full' or \
                     original_title_highlight.get('matchLevel') == 'full':
                 logger.info(f"Found strong title match for '{title}': {hit.get('title')} ({hit.get('objectID')})")
-                return hit  # hit is already a dict
+                return hit
 
             if hit.get("title", "").lower() == title.lower() or \
                     hit.get("originalTitle", "").lower() == title.lower():
@@ -276,7 +285,7 @@ async def find_movie_by_title(client: SearchClient, index_name: str, title: str)
         # If no strong match, return the top hit if any
         logger.info(
             f"No strong/exact title match for '{title}', returning top relevant hit: {search_result.hits[0].get('title')} ({search_result.hits[0].get('objectID')})")
-        return search_result.hits[0]  # hit is already a dict
+        return search_result.hits[0]
 
     except Exception as e:
         logger.error(f"Error finding movie by title '{title}' in Algolia: {e}", exc_info=True)
@@ -292,31 +301,30 @@ async def search_movies_for_vote(client: SearchClient, index_name: str, title: s
     if not title:
         return {"hits": [], "nbHits": 0}
     try:
-        search_params_payload = {
-            "requests": [
-                {
-                    "indexName": index_name,
-                    "query": title,
-                    "params": {
-                        "hitsPerPage": 5,
-                        "attributesToRetrieve": [
-                            "objectID", "title", "year", "votes", "image"
-                        ],
-                        "typoTolerance": True  # More lenient typo tolerance for voting
+        search_response = await client.search(
+            search_method_params={
+                "requests": [
+                    {
+                        "indexName": index_name,
+                        "query": title,
+                        "params": {
+                            "hitsPerPage": 5,
+                            "attributesToRetrieve": [
+                                "objectID", "title", "year", "votes", "image"
+                            ],
+                            "typoTolerance": True
+                        }
                     }
-                }
-            ]
-        }
+                ]
+            }
+        )
 
-        search_responses_obj = await client.search(search_method_params=search_params_payload)
-        if not search_responses_obj.results or len(search_responses_obj.results) == 0:
-            logger.warning(f"No results array from Algolia for search_movies_for_vote with title '{title}'")
+        if not search_response or not hasattr(search_response, 'results') or len(search_response.results) == 0:
+            logger.warning(f"No results from Algolia for search_movies_for_vote with title '{title}'")
             return {"hits": [], "nbHits": 0}
 
-        search_result = search_responses_obj.results[0]
-
+        search_result = search_response.results[0]
         logger.info(f"Vote search for '{title}' found {search_result.nb_hits} hits.")
-        # search_result.hits are already dictionaries
         return {"hits": search_result.hits, "nbHits": search_result.nb_hits}
 
     except Exception as e:
@@ -327,35 +335,30 @@ async def search_movies_for_vote(client: SearchClient, index_name: str, title: s
 async def get_top_movies(client: SearchClient, index_name: str, count: int = 5) -> List[Dict[str, Any]]:
     """Get the top voted movies from Algolia movies index."""
     try:
-        search_params_payload = {
-            "requests": [
-                {
-                    "indexName": index_name,
-                    "query": "",  # No query text needed for fetching by rank/filter
-                    "params": {
-                        # "filters": "votes > 0", # Not needed if relying on custom ranking primarily
-                        "hitsPerPage": count,
-                        "attributesToRetrieve": [
-                            "objectID", "title", "year", "director",
-                            "actors", "genre", "image", "votes", "plot", "rating"
-                        ],
-                        # Ensure your index has customRanking: desc(votes), asc(title) or similar
+        search_response = await client.search(
+            search_method_params={
+                "requests": [
+                    {
+                        "indexName": index_name,
+                        "query": "",
+                        "params": {
+                            "hitsPerPage": count,
+                            "attributesToRetrieve": [
+                                "objectID", "title", "year", "director",
+                                "actors", "genre", "image", "votes", "plot", "rating"
+                            ]
+                        }
                     }
-                }
-            ]
-        }
+                ]
+            }
+        )
 
-        search_response = await client.search(search_method_params=search_params_payload)
-        if not search_response.results or len(search_response.results) == 0:
-            logger.warning(f"No results array from Algolia for get_top_movies")
+        if not search_response or not hasattr(search_response, 'results') or len(search_response.results) == 0:
+            logger.warning(f"No results from Algolia for get_top_movies")
             return []
 
         search_result = search_response.results[0]
-
-        # Hits are already sorted by Algolia based on ranking formula (which should include votes)
-        # If you need to be absolutely sure or apply a secondary sort in Python:
-        # top_movies = sorted(search_result.hits, key=lambda m: m.get("votes", 0), reverse=True)
-        return search_result.hits  # hits are already dicts
+        return search_result.hits
 
     except Exception as e:
         logger.error(f"Error getting top {count} movies from Algolia: {e}", exc_info=True)
@@ -366,9 +369,11 @@ async def get_all_movies(client: SearchClient, index_name: str) -> List[Dict[str
     """Get all movies from Algolia movies index using browse_objects."""
     all_movies: List[Dict[str, Any]] = []
     try:
-        # browse_objects is an async generator in v4
-        async for hit in client.browse_objects(index_name=index_name):
-            all_movies.append(hit)  # hit is already a dict
+        # Fixed: Use correct v4 API for browse_objects with proper aggregator
+        browse_response = await client.browse_objects(
+            index_name=index_name,
+            aggregator=lambda obj: all_movies.append(obj)
+        )
 
         logger.info(f"Fetched {len(all_movies)} movies from Algolia using browse_objects.")
         # Sort in Python if needed, though browse doesn't guarantee order like search
@@ -378,4 +383,29 @@ async def get_all_movies(client: SearchClient, index_name: str) -> List[Dict[str
 
     except Exception as e:
         logger.error(f"Error getting all movies from Algolia: {e}", exc_info=True)
+        # Fallback to search-based approach
+        try:
+            logger.info("Attempting fallback search-based approach for get_all_movies")
+            search_response = await client.search(
+                search_method_params={
+                    "requests": [
+                        {
+                            "indexName": index_name,
+                            "query": "",
+                            "params": {
+                                "hitsPerPage": 1000  # Increase if needed
+                            }
+                        }
+                    ]
+                }
+            )
+
+            if search_response and search_response.results:
+                all_movies = search_response.results[0].hits
+                all_movies.sort(key=lambda m: (m.get("votes", 0), m.get("title", "")), reverse=True)
+                logger.info(f"Fallback fetched {len(all_movies)} movies using search")
+                return all_movies
+        except Exception as fallback_e:
+            logger.error(f"Fallback search also failed: {fallback_e}", exc_info=True)
+
         return []

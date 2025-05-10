@@ -10,6 +10,63 @@ from typing import List, Dict, Any, Optional, Union
 
 logger = logging.getLogger("paradiso_bot")
 
+def format_movie_embed(movie: Dict[str, Any], title_prefix: str = "") -> discord.Embed:
+    """
+    Format a movie object into a Discord embed.
+
+    Args:
+        movie: Movie dictionary with details
+        title_prefix: Prefix to add to the title
+
+    Returns:
+        Discord embed with movie information
+    """
+    # Extract basic information
+    title = movie.get("title", "Unknown")
+    year = f" ({movie.get('year')})" if movie.get('year') is not None else ""
+    votes = movie.get("votes", 0)
+    rating = movie.get("rating")
+    director = movie.get("director")
+    genre = movie.get("genre", [])
+    plot = movie.get("plot")
+    image = movie.get("image")
+
+    # Create embed with optional title prefix
+    embed_title = f"{title_prefix}{title}{year}" if title else f"{title_prefix}Unknown Movie"
+    embed = discord.Embed(
+        title=embed_title,
+        color=0x00ff00
+    )
+
+    # Add description if there's a plot
+    if plot:
+        # Truncate long plots
+        if len(plot) > 200:
+            plot = plot[:197] + "..."
+        embed.description = plot
+
+    # Set thumbnail if available
+    if image:
+        embed.set_thumbnail(url=image)
+
+    # Add director
+    if director and director != "Unknown":
+        embed.add_field(name="Director", value=director, inline=True)
+
+    # Add rating
+    if rating is not None:
+        embed.add_field(name="Rating", value=f"⭐ {rating}/10", inline=True)
+
+    # Add votes
+    embed.add_field(name="Votes", value=f"🗳️ {votes}", inline=True)
+
+    # Add genres
+    if genre:
+        embed.add_field(name="Genres", value=", ".join(genre), inline=True)
+
+    return embed
+
+
 async def send_search_results_embed(
     channel: Union[discord.Webhook, discord.abc.Messageable],
     query: str,

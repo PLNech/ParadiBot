@@ -284,25 +284,27 @@ class ParadisoBot:
                 await channel.send("Please provide a search term.")
                 return
 
-            search_request_payload = {
-                "requests": [
-                    {
-                        "indexName": self.algolia_movies_index_name,
-                        "query": query,
-                        "params": {
-                            "hitsPerPage": 5,
-                            "attributesToRetrieve": [
-                                "objectID", "title", "year", "director", "actors", "genre", "image", "votes", "plot",
-                                "rating"
-                            ],
-                            "attributesToHighlight": ["title", "director", "actors", "plot", "genre"],
-                            "attributesToSnippet": ["plot:15"]
-                        }
-                    }
-                ]
-            }
+            # Fixed: Use correct v4 API payload structure
             search_response = await self.algolia_client.search(
-                search_method_params=search_request_payload)
+                search_method_params={
+                    "requests": [
+                        {
+                            "indexName": self.algolia_movies_index_name,
+                            "query": query,
+                            "params": {
+                                "hitsPerPage": 5,
+                                "attributesToRetrieve": [
+                                    "objectID", "title", "year", "director", "actors", "genre", "image", "votes",
+                                    "plot",
+                                    "rating"
+                                ],
+                                "attributesToHighlight": ["title", "director", "actors", "plot", "genre"],
+                                "attributesToSnippet": ["plot:15"]
+                            }
+                        }
+                    ]
+                }
+            )
 
             if not search_response.results:
                 await channel.send(f"No results found for '{query}'.")
@@ -314,6 +316,162 @@ class ParadisoBot:
         except Exception as e:
             logger.error(f"Error in manual search command: {e}", exc_info=True)
             await channel.send(f"An error occurred: {str(e)}")
+
+    async def cmd_search(self, interaction: discord.Interaction, query: str):
+        await interaction.response.defer()
+        try:
+            main_query, filter_string = parse_algolia_filters(query)
+            logger.info(f"Parsed Search: Query='{main_query}', Filters='{filter_string}'")
+
+            # Fixed: Use correct v4 API payload structure with filters
+            search_params = {
+                "hitsPerPage": 5,
+                "attributesToRetrieve": ["*", "objectID"],
+                "attributesToHighlight": ["title", "director", "actors", "plot", "genre"],
+                "attributesToSnippet": ["plot:20"]
+            }
+
+            # Only add filters if they exist
+            if filter_string:
+                search_params["filters"] = filter_string
+
+            search_response = await self.algolia_client.search(
+                search_method_params={
+                    "requests": [
+                        {
+                            "indexName": self.algolia_movies_index_name,
+                            "query": main_query,
+                            "params": search_params
+                        }
+                    ]
+                }
+            )
+
+            if not search_response.results:
+                await interaction.followup.send(f"No results found for '{query}'.")
+                return
+
+            search_result = search_response.results[0]
+            await send_search_results_embed(interaction.followup, query, search_result.hits, search_result.nb_hits)
+
+        except Exception as e:
+            logger.error(f"Error in /search command: {e}", exc_info=True)
+            await interaction.followup.send(f"❌ Error searching: {str(e)}")
+
+    async def cmd_random(self, interaction: discord.Interaction):
+        """Slash command to get a random unvoted movie."""
+        await interaction.response.defer(thinking=True)
+        try:
+            # Fixed: Use correct v4 API payload structure
+            count_response = await self.algolia_client.search(
+                search_method_params={
+                    "requests": [{
+                        "indexName": self.algolia_movies_index_name,
+                        "query": "",
+                        "params": {
+                            "filters": "votes = 0",
+                            "hitsPerPage": 0,
+                            "analytics": False
+                        }
+                    }]
+                }
+            )
+
+            if not count_response.results or count_response.results[0].nb_hits == 0:
+                await interaction.followup.send(
+                    "🎉 No unvoted movies found! Everything has at least one vote or the queue is empty.")
+                return
+
+            nb_hits_zero_votes = count_response.results[0].nb_hits
+            random_page_index = random.randint(0, nb_hits_zero_votes - 1)
+
+            # Fixed: Use correct v4 API payload structure for fetching random movie
+            movie_response = await self.algolia_client.search(
+                search_method_params={
+                    "requests": [{
+                        "indexName": self.algolia_movies_index_name,
+                        "query": "",
+                        "params": {
+                            "filters": "votes = 0",
+                            "hitsPerPage": 1,
+                            "page": random_page_index,
+                            "attributesToRetrieve": ["*", "objectID"]
+                        }
+                    }]
+                }
+            )
+
+            if not movie_response.results or not movie_response.results[0].hits:
+                await interaction.followup.send(
+                    "🤔 Couldn't fetch a random unvoted movie, though some should exist. Please try again.")
+                logger.warning(
+                    f"/random: nb_hits_zero_votes was {nb_hits_zero_votes} but failed to fetch on page {random_page_index}")
+                return
+
+            random_movie = movie_response.results[0].hits[0]
+            embed = format_movie_embed(random_movie, title_prefix="🎲 Random Unvoted Movie:")
+            embed.add_field(name="Votes", value=str(random_movie.get("votes", 0)), inline=True)
+            embed.set_footer(text="Why not give this one a vote? Use /vote")
+            await interaction.followup.send(embed=embed)
+
+        except Exception as e:
+            logger.error(f"Error in /random command: {e}", exc_info=True)
+            await interaction.followup.send(f"❌ An error occurred while fetching a random movie: {str(e)}")
+
+    # Also update the _handle_random_command method similarly
+    async def _handle_random_command(self, channel: Union[discord.TextChannel, discord.DMChannel]):
+        """Handles text-based random command."""
+        try:
+            # Fixed: Use correct v4 API payload structure
+            count_response = await self.algolia_client.search(
+                search_method_params={
+                    "requests": [{
+                        "indexName": self.algolia_movies_index_name,
+                        "query": "",
+                        "params": {
+                            "filters": "votes = 0",
+                            "hitsPerPage": 0,
+                            "analytics": False
+                        }
+                    }]
+                }
+            )
+
+            if not count_response.results or count_response.results[0].nb_hits == 0:
+                await channel.send("🎉 No unvoted movies found! Everything has at least one vote or the queue is empty.")
+                return
+
+            nb_hits_zero_votes = count_response.results[0].nb_hits
+            random_page = random.randint(0, nb_hits_zero_votes - 1)
+
+            # Fixed: Use correct v4 API payload structure for fetching random movie
+            movie_response = await self.algolia_client.search(
+                search_method_params={
+                    "requests": [{
+                        "indexName": self.algolia_movies_index_name,
+                        "query": "",
+                        "params": {
+                            "filters": "votes = 0",
+                            "hitsPerPage": 1,
+                            "page": random_page,
+                            "attributesToRetrieve": ["*", "objectID"]
+                        }
+                    }]
+                }
+            )
+
+            if not movie_response.results or not movie_response.results[0].hits:
+                await channel.send("🤔 Couldn't fetch a random unvoted movie, though some exist. Please try again.")
+                return
+
+            random_movie = movie_response.results[0].hits[0]
+            embed = format_movie_embed(random_movie, title_prefix="🎲 Random Unvoted Movie:")
+            embed.add_field(name="Votes", value=str(random_movie.get("votes", 0)), inline=True)
+            await channel.send(embed=embed)
+
+        except Exception as e:
+            logger.error(f"Error in /random command: {e}", exc_info=True)
+            await channel.send(f"❌ An error occurred while fetching a random movie: {str(e)}")
 
     async def _handle_info_command(self, channel: Union[discord.TextChannel, discord.DMChannel], query: str):
         try:
@@ -683,41 +841,6 @@ class ParadisoBot:
         embed.set_footer(text=f"Total movies: {len(all_movies)}")
         return embed
 
-    async def cmd_search(self, interaction: discord.Interaction, query: str):
-        await interaction.response.defer()
-        try:
-            main_query, filter_string = parse_algolia_filters(query)
-            logger.info(f"Parsed Search: Query='{main_query}', Filters='{filter_string}'")
-
-            search_request_payload = {
-                "requests": [
-                    {
-                        "indexName": self.algolia_movies_index_name,
-                        "query": main_query,
-                        "params": {
-                            "hitsPerPage": 5,  # Or more for slash command
-                            "attributesToRetrieve": ["*", "objectID"],  # Get all for display
-                            "attributesToHighlight": ["title", "director", "actors", "plot", "genre"],
-                            "attributesToSnippet": ["plot:20"],
-                            "filters": filter_string
-                        }
-                    }
-                ]
-            }
-            search_response = await self.algolia_client.search(
-                search_method_params=search_request_payload)
-
-            if not search_response.results:
-                await interaction.followup.send(f"No results found for '{query}'.")
-                return
-
-            search_result = search_response.results[0]
-            await send_search_results_embed(interaction.followup, query, search_result.hits, search_result.nb_hits)
-
-        except Exception as e:
-            logger.error(f"Error in /search command: {e}", exc_info=True)
-            await interaction.followup.send(f"❌ Error searching: {str(e)}")
-
     async def cmd_recommend(self, interaction: discord.Interaction, movie_title: str, model: str = "related"):
         await interaction.response.defer(thinking=True)
         try:
@@ -813,71 +936,6 @@ class ParadisoBot:
         except Exception as e:
             logger.error(f"Error in /info: {e}", exc_info=True)
             await interaction.followup.send(f"❌ Error fetching info: {str(e)}")
-
-    async def cmd_random(self, interaction: discord.Interaction):
-        """Slash command to get a random unvoted movie."""
-        await interaction.response.defer(thinking=True)
-        try:
-            # 1. Get count of movies with 0 votes
-            # Using search with hitsPerPage=0 is efficient for getting counts
-            count_payload = {
-                "requests": [{
-                    "indexName": self.algolia_movies_index_name,
-                    "query": "",  # Match all documents
-                    "params": {
-                        "filters": "votes = 0",  # Filter for movies with 0 votes
-                        "hitsPerPage": 0,  # We only need the count (nbHits)
-                        "analytics": False  # Disable analytics for this internal query
-                    }
-                }]
-            }
-            count_response = await self.algolia_client.search(
-                search_method_params=count_payload)
-
-            if not count_response.results or count_response.results[0].nb_hits == 0:
-                await interaction.followup.send(
-                    "🎉 No unvoted movies found! Everything has at least one vote or the queue is empty.")
-                return
-
-            nb_hits_zero_votes = count_response.results[0].nb_hits
-
-            # 2. Fetch one random movie from that set
-            # Algolia's 'page' parameter is 0-indexed.
-            random_page_index = random.randint(0, nb_hits_zero_votes - 1)
-
-            fetch_payload = {
-                "requests": [{
-                    "indexName": self.algolia_movies_index_name,
-                    "query": "",
-                    "params": {
-                        "filters": "votes = 0",
-                        "hitsPerPage": 1,  # We need only one movie
-                        "page": random_page_index,  # Fetch the specific "page" (which is our random movie)
-                        "attributesToRetrieve": ["*", "objectID"]  # Get all attributes for display
-                    }
-                }]
-            }
-            movie_response = await self.algolia_client.search(
-                search_method_params=fetch_payload)
-
-            if not movie_response.results or not movie_response.results[0].hits:
-                # This case should be rare if nb_hits_zero_votes > 0
-                await interaction.followup.send(
-                    "🤔 Couldn't fetch a random unvoted movie, though some should exist. Please try again.")
-                logger.warning(
-                    f"/random: nb_hits_zero_votes was {nb_hits_zero_votes} but failed to fetch on page {random_page_index}")
-                return
-
-            random_movie = movie_response.results[0].hits[0]  # Get the single hit
-
-            embed = format_movie_embed(random_movie, title_prefix="🎲 Random Unvoted Movie:")
-            embed.add_field(name="Votes", value=str(random_movie.get("votes", 0)), inline=True)  # Should be 0
-            embed.set_footer(text="Why not give this one a vote? Use /vote")
-            await interaction.followup.send(embed=embed)
-
-        except Exception as e:
-            logger.error(f"Error in /random command: {e}", exc_info=True)
-            await interaction.followup.send(f"❌ An error occurred while fetching a random movie: {str(e)}")
 
     async def cmd_help(self, interaction: discord.Interaction):
         embed = discord.Embed(title="👋 Paradiso Bot Help", color=0x03a9f4)
