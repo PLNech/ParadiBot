@@ -1,11 +1,13 @@
 #!/usr/bin/env python
 """
-Paradiso Discord Bot (Algolia v3 - Improved)
+Paradiso Discord Bot (Algolia v3 - Complete)
 
-A Discord bot for the Paradiso movie voting system with improved features:
-- Better movie addition with exact matching and confirmation
-- Fixed random command
-- Recommendation carousels
+A Discord bot for the Paradiso movie voting system with full feature set:
+- Movie addition with exact matching and confirmation
+- Voting system with proper error handling
+- Random movie selection with history tracking
+- Full recommendation support (related and visual similarity)
+- All slash commands and text commands
 """
 
 import datetime
@@ -24,7 +26,7 @@ from dotenv import load_dotenv
 # Import utilities
 from utils.algolia_utils import (
     add_movie_to_algolia, vote_for_movie, find_movie_by_title, search_movies_for_vote, get_top_movies, get_all_movies,
-    generate_user_token, _check_movie_exists, get_random_movie
+    generate_user_token, _check_movie_exists, get_random_movie, get_recommendations
 )
 from utils.embed_formatters import send_search_results_embed, send_detailed_movie_embed, format_movie_embed
 from utils.parser import parse_algolia_filters
@@ -287,6 +289,267 @@ class ParadisoBot:
             logger.error(f"Error in manual search command: {e}", exc_info=True)
             await channel.send(f"An error occurred: {str(e)}")
 
+    async def _handle_info_command(self, channel: Union[discord.TextChannel, discord.DMChannel], query: str):
+        try:
+            movie = await find_movie_by_title(self.algolia_client, self.algolia_movies_index_name, query)
+            if not movie:
+                await channel.send(f"Could not find '{query}'. Use `search [query]`.")
+                return
+            await send_detailed_movie_embed(channel, movie)
+        except Exception as e:
+            logger.error(f"Error in manual info command: {e}", exc_info=True)
+            await channel.send(f"An error occurred: {str(e)}")
+
+    async def _start_add_movie_flow(self, message: discord.Message, title: str):
+        user_id = message.author.id
+        if user_id in self.add_movie_flows:
+            await message.channel.send("You are already adding a movie. Complete or type 'cancel'.")
+            return
+
+        try:
+            # V3 API: Simple index.search call
+            index = self.algolia_client.init_index(self.algolia_movies_index_name)
+            search_response = index.search(title, {
+                'hitsPerPage': 3,
+                'attributesToRetrieve': ['objectID', 'title', 'year', 'votes']
+            })
+
+            dm_channel = await message.author.create_dm()
+            if search_response.get('nbHits', 0) > 0:
+                embed = discord.Embed(title=f"Movies Found Matching '{title}'", color=0xffa500)
+                for i, hit in enumerate(search_response.get('hits', [])):
+                    embed.add_field(name=f"{i + 1}. {hit.get('title', 'Unknown')} ({hit.get('year', 'N/A')})",
+                                    value=f"Votes: {hit.get('votes', 0)}. Reply 'add new' to add yours.", inline=False)
+                self.add_movie_flows[user_id] = {'title': title, 'stage': 'await_add_new_confirmation',
+                                                 'channel': dm_channel, 'original_channel': message.channel}
+                await dm_channel.send(embed=embed)
+                if not isinstance(message.channel, discord.DMChannel):
+                    await message.channel.send(f"📬 Found matches for '{title}'. Check DMs ({dm_channel.mention}).")
+            else:
+                self.add_movie_flows[user_id] = {'title': title, 'year': None, 'stage': 'year', 'channel': dm_channel,
+                                                 'original_channel': message.channel}
+                await dm_channel.send(
+                    f"📽️ No matches for '{title}'. Let's add it!\nYear released? ('unknown' or 'cancel')")
+                if not isinstance(message.channel, discord.DMChannel):
+                    await message.channel.send(
+                        f"📬 No matches for '{title}'. Check DMs ({dm_channel.mention}) to add details.")
+        except Exception as e:
+            logger.error(f"Error in text add flow start: {e}", exc_info=True)
+            await message.channel.send("Error searching. Try again.")
+            if user_id in self.add_movie_flows: del self.add_movie_flows[user_id]
+
+    async def _handle_add_movie_flow(self, message: discord.Message):
+        user_id = message.author.id
+        flow = self.add_movie_flows.get(user_id)
+        if not flow or message.channel.id != flow['channel'].id: return
+        response = message.content.strip()
+
+        if response.lower() == 'cancel':
+            await message.channel.send("Movie addition cancelled.")
+            if flow.get('original_channel') and not isinstance(flow['original_channel'], discord.DMChannel):
+                try:
+                    await flow['original_channel'].send(f"Addition of '{flow.get('title', 'movie')}' cancelled.")
+                except:
+                    pass
+            del self.add_movie_flows[user_id]
+            return
+
+        if flow['stage'] == 'await_add_new_confirmation':
+            if response.lower() == 'add new':
+                flow['stage'] = 'year'
+                await message.channel.send(
+                    f"Adding new movie: '{flow['title']}'\nYear released? ('unknown' or 'cancel')")
+            else:
+                await message.channel.send(f"Reply 'add new' to add '{flow['title']}' or 'cancel' to stop.")
+
+        elif flow['stage'] == 'year':
+            if response.lower() == 'unknown':
+                flow['year'] = None
+            else:
+                try:
+                    year = int(response)
+                    if 1850 <= year <= 2030:
+                        flow['year'] = year
+                    else:
+                        await message.channel.send("Year must be between 1850 and 2030.")
+                        return
+                except ValueError:
+                    await message.channel.send("Enter a valid year number.")
+                    return
+            flow['stage'] = 'director'
+            await message.channel.send("Director? ('unknown' or 'cancel')")
+
+        elif flow['stage'] == 'director':
+            flow['director'] = response if response.lower() != 'unknown' else None
+            flow['stage'] = 'actors'
+            await message.channel.send("Actors? (comma-separated or 'unknown')")
+
+        elif flow['stage'] == 'actors':
+            if response.lower() == 'unknown':
+                flow['actors'] = []
+            else:
+                flow['actors'] = [a.strip() for a in response.split(',') if a.strip()]
+            flow['stage'] = 'genre'
+            await message.channel.send("Genres? (comma-separated or 'unknown')")
+
+        elif flow['stage'] == 'genre':
+            if response.lower() == 'unknown':
+                flow['genre'] = []
+            else:
+                flow['genre'] = [g.strip() for g in response.split(',') if g.strip()]
+            flow['stage'] = 'confirm_manual'
+
+            # Show summary for confirmation
+            embed = discord.Embed(title=f"Confirm adding: {flow['title']}", color=0x00ff00)
+            embed.add_field(name="Year", value=flow.get('year') or 'Unknown', inline=True)
+            embed.add_field(name="Director", value=flow.get('director') or 'Unknown', inline=True)
+            embed.add_field(name="Actors", value=', '.join(flow.get('actors', [])) or 'Unknown', inline=False)
+            embed.add_field(name="Genres", value=', '.join(flow.get('genre', [])) or 'Unknown', inline=False)
+            await message.channel.send(embed=embed)
+            await message.channel.send("Add this movie? ('yes' or 'no')")
+
+        elif flow['stage'] == 'confirm_manual':
+            if response.lower() in ['yes', 'y']:
+                movie_data = {
+                    "objectID": f"manual_{int(time.time())}_{random.randint(0, 999)}",
+                    "title": flow.get('title', 'Unknown Movie'),
+                    "originalTitle": flow.get('title', 'Unknown Movie'),
+                    "year": flow['year'],
+                    "director": flow.get('director') or "Unknown",
+                    "actors": flow.get('actors', []),
+                    "genre": flow.get('genre', []),
+                    "plot": f"Added manually by {message.author.display_name}.",
+                    "image": None,
+                    "rating": None,
+                    "imdbID": None,
+                    "tmdbID": None,
+                    "source": "manual",
+                    "votes": 0,
+                    "addedDate": int(time.time()),
+                    "addedBy": generate_user_token(str(message.author.id)),
+                }
+                await self._add_movie_from_flow(user_id, movie_data, message.author, flow.get('original_channel'))
+            elif response.lower() in ['no', 'n']:
+                await message.channel.send("Movie addition cancelled.")
+                if flow.get('original_channel') and not isinstance(flow['original_channel'], discord.DMChannel):
+                    try:
+                        await flow['original_channel'].send(f"Addition of '{flow['title']}' cancelled.")
+                    except:
+                        pass
+                del self.add_movie_flows[user_id]
+            else:
+                await message.channel.send("Please respond with 'yes' or 'no'.")
+
+    async def _add_movie_from_flow(self, user_id: int, movie_data: Dict[str, Any], author: discord.User,
+                                   original_channel: Optional[discord.TextChannel]):
+        try:
+            existing_movie = await _check_movie_exists(self.algolia_client, self.algolia_movies_index_name,
+                                                       movie_data['title'], movie_data.get('year'))
+            if existing_movie:
+                await self.add_movie_flows[user_id]['channel'].send(
+                    f"❌ Similar movie exists: '{existing_movie['title']}' ({existing_movie.get('year', 'N/A')})")
+                if original_channel and not isinstance(original_channel, discord.DMChannel):
+                    try:
+                        await original_channel.send(
+                            f"❌ Similar movie exists: '{existing_movie['title']}' ({existing_movie.get('year', 'N/A')})")
+                    except:
+                        pass
+                del self.add_movie_flows[user_id]
+                return
+
+            await add_movie_to_algolia(self.algolia_client, self.algolia_movies_index_name, movie_data)
+            logger.info(f"Added movie via text flow: {movie_data.get('title')} ({movie_data.get('objectID')})")
+            embed = format_movie_embed(movie_data, title_prefix="🎬 Added: ")
+            embed.set_footer(text=f"Added by {author.display_name}")
+            await self.add_movie_flows[user_id]['channel'].send("✅ Movie added!", embed=embed)
+            if original_channel and original_channel != self.add_movie_flows[user_id]['channel'] and not isinstance(
+                    original_channel, discord.DMChannel):
+                try:
+                    await original_channel.send(f"✅ Movie '{movie_data['title']}' added!")
+                except:
+                    pass
+        except Exception as e:
+            logger.error(f"Error in _add_movie_from_flow: {e}", exc_info=True)
+            await self.add_movie_flows[user_id]['channel'].send(f"❌ Error adding movie: {str(e)}")
+        finally:
+            if user_id in self.add_movie_flows:
+                del self.add_movie_flows[user_id]
+
+    async def _handle_vote_command(self, channel: Union[discord.TextChannel, discord.DMChannel], author: discord.User,
+                                   title: str):
+        try:
+            search_results_dict = await search_movies_for_vote(self.algolia_client, self.algolia_movies_index_name,
+                                                               title)
+
+            if search_results_dict["nbHits"] == 0:
+                await channel.send(f"❌ No movies matching '{title}'. Use `movies` or `search`.")
+                return
+
+            hits = search_results_dict["hits"]
+            if search_results_dict["nbHits"] == 1:
+                movie_to_vote = hits[0]
+                await channel.send(f"Found '{movie_to_vote['title']}'. Voting...")
+                success, result = await vote_for_movie(self.algolia_client, self.algolia_movies_index_name,
+                                                       self.algolia_votes_index_name, movie_to_vote["objectID"],
+                                                       str(author.id))
+                if success:
+                    embed = format_movie_embed(result,
+                                               title_prefix=f"✅ Vote recorded for: {result['title']}")
+                    embed.description = f"This movie now has {result['votes']} vote(s)!"
+                    await channel.send(embed=embed)
+                else:
+                    await channel.send(f"❌ {result}" if isinstance(result, str) else "❌ Error voting.")
+            else:
+                choices = hits[:5]
+                embed = discord.Embed(title=f"Multiple matches for '{title}'", color=0xffa500)
+                for i, movie in enumerate(choices):
+                    embed.add_field(name=f"{i + 1}. {movie.get('title', 'Unknown')} ({movie.get('year', 'N/A')})",
+                                    value=f"Votes: {movie.get('votes', 0)}. Reply # or 'cancel'.", inline=False)
+                dm_channel = await author.create_dm()
+                self.pending_votes[author.id] = {'channel': dm_channel, 'choices': choices, 'timestamp': time.time()}
+                await dm_channel.send(embed=embed)
+                if not isinstance(channel, discord.DMChannel):
+                    await channel.send(f"Multiple matches for '{title}'. Check DMs ({dm_channel.mention}).")
+        except Exception as e:
+            logger.error(f"Error in manual vote command for '{title}': {e}", exc_info=True)
+            await channel.send(f"❌ Error searching: {str(e)}")
+
+    async def _handle_movies_command(self, channel: Union[discord.TextChannel, discord.DMChannel]):
+        try:
+            top_movies = await get_top_movies(self.algolia_client, self.algolia_movies_index_name, 10)
+            if not top_movies:
+                await channel.send("No movies voted yet! Use `add [title]` or `/add`.")
+                return
+            embed = discord.Embed(title="🎬 Paradiso Movie Night Voting (Top 10)", color=0x03a9f4)
+            for i, movie in enumerate(top_movies):
+                medal = "🥇🥈🥉"[i] if i < 3 else f"{i + 1}."
+                embed.add_field(name=f"{medal} {movie.get('title', 'N/A')} ({movie.get('year', 'N/A')})",
+                                value=f"Votes: {movie.get('votes', 0)} | Rating: {movie.get('rating', 'N/A')}/10",
+                                inline=False)
+            embed.set_footer(text="Use 'vote [title]' or /vote. /movies in server for full list.")
+            await channel.send(embed=embed)
+        except Exception as e:
+            logger.error(f"Error in manual movies cmd: {e}", exc_info=True)
+            await channel.send("Error getting movies.")
+
+    async def _handle_top_command(self, channel: Union[discord.TextChannel, discord.DMChannel], count: int = 5):
+        try:
+            count = max(1, min(10, count))
+            top_movies = await get_top_movies(self.algolia_client, self.algolia_movies_index_name, count)
+            if not top_movies:
+                await channel.send("❌ No movies voted yet!")
+                return
+            embed = discord.Embed(title=f"🏆 Top {len(top_movies)} Voted Movies", color=0x00ff00)
+            for i, movie in enumerate(top_movies):
+                medal = "🥇🥈🥉"[i] if i < 3 else f"{i + 1}."
+                details = [f"**Votes**: {movie.get('votes', 0)}", f"**Year**: {movie.get('year', 'N/A')}"]
+                if movie.get("rating") is not None: details.append(f"**Rating**: ⭐ {movie['rating']}/10")
+                embed.add_field(name=f"{medal} {movie.get('title', 'N/A')}", value="\n".join(details), inline=False)
+            await channel.send(embed=embed)
+        except Exception as e:
+            logger.error(f"Error in manual top cmd: {e}", exc_info=True)
+            await channel.send(f"❌ Error: {str(e)}")
+
     async def _handle_random_command(self, channel: Union[discord.TextChannel, discord.DMChannel]):
         """Handles text-based random command - now shows any random movie."""
         try:
@@ -313,9 +576,332 @@ class ParadisoBot:
             logger.error(f"Error in /random command: {e}", exc_info=True)
             await channel.send(f"❌ An error occurred while fetching a random movie: {str(e)}")
 
-    # ... (other text command handlers remain similar)
+    async def _handle_vote_selection_response(self, message: discord.Message, flow_state: Dict[str, Any]):
+        user_id = message.author.id
+        response = message.content.strip()
+
+        # Check timeout
+        if time.time() - flow_state['timestamp'] > 60:
+            await message.channel.send("Vote selection timed out. Please try again.")
+            del self.pending_votes[user_id]
+            return
+
+        if response.lower() == 'cancel':
+            await message.channel.send("Vote cancelled.")
+            del self.pending_votes[user_id]
+            return
+
+        try:
+            selection = int(response)
+            choices = flow_state['choices']
+            if 1 <= selection <= len(choices):
+                chosen_movie = choices[selection - 1]
+                await message.channel.send(f"Voting for '{chosen_movie['title']}'...")
+                success, result = await vote_for_movie(self.algolia_client, self.algolia_movies_index_name,
+                                                       self.algolia_votes_index_name, chosen_movie["objectID"],
+                                                       str(user_id))
+                if success:
+                    embed = format_movie_embed(result,
+                                               title_prefix=f"✅ Vote recorded for: {result['title']}")
+                    embed.description = f"This movie now has {result['votes']} vote(s)!"
+                    await message.channel.send(embed=embed)
+                    # Notify original channel if different
+                    if flow_state.get('original_channel'):
+                        try:
+                            await flow_state['original_channel'].send(f"✅ Vote recorded for '{result['title']}'!")
+                        except:
+                            pass
+                else:
+                    await message.channel.send(f"❌ {result}" if isinstance(result, str) else "❌ Error voting.")
+            else:
+                await message.channel.send(f"Invalid selection. Enter 1-{len(choices)} or 'cancel'.")
+                return
+        except ValueError:
+            await message.channel.send(f"Invalid input. Enter # or 'cancel'.")
+            return
+        except Exception as e:
+            logger.error(f"Error in text vote selection for user {user_id}: {e}", exc_info=True)
+            await message.channel.send(f"❌ Error processing vote: {str(e)}")
+        finally:
+            if user_id in self.pending_votes:
+                del self.pending_votes[user_id]
 
     # --- Slash Command Handlers ---
+
+    async def cmd_vote(self, interaction: discord.Interaction, title: str):
+        await interaction.response.defer(thinking=True)
+        user_id = interaction.user.id
+        try:
+            search_results_dict = await search_movies_for_vote(self.algolia_client, self.algolia_movies_index_name,
+                                                               title)
+            if search_results_dict["nbHits"] == 0:
+                await interaction.followup.send(f"❌ No movies matching '{title}'. Use `/movies` or `/search`.")
+                return
+
+            hits = search_results_dict["hits"]
+            if search_results_dict["nbHits"] == 1:
+                movie_to_vote = hits[0]
+                success, result = await vote_for_movie(self.algolia_client, self.algolia_movies_index_name,
+                                                       self.algolia_votes_index_name, movie_to_vote["objectID"],
+                                                       str(user_id))
+                if success:
+                    embed = format_movie_embed(result, title_prefix=f"✅ Vote recorded for: {result['title']}")
+                    embed.description = f"This movie now has {result['votes']} vote(s)!"
+                    await interaction.followup.send(embed=embed)
+                else:
+                    await interaction.followup.send(f"❌ {result}" if isinstance(result, str) else "❌ Error voting.")
+            else:
+                choices = hits[:5]
+                embed = discord.Embed(title=f"Multiple movies for '{title}'",
+                                      description="Select the movie to vote for:", color=0xffa500)
+                choice_list_desc = [
+                    f"{i + 1}. {m.get('title', 'N/A')} ({m.get('year', 'N/A')}) - Votes: {m.get('votes', 0)}" for i, m
+                    in enumerate(choices)]
+                embed.add_field(name="Choices", value="\n".join(choice_list_desc), inline=False)
+                view = VoteSelectionView(self, user_id, choices)
+                message = await interaction.followup.send(embed=embed, view=view)
+                self.vote_messages[message.id] = {'user_id': user_id, 'choices': choices}
+                view.message = message
+        except Exception as e:
+            logger.error(f"Error in /vote for '{title}': {e}", exc_info=True)
+            await interaction.followup.send(f"❌ Error searching: {str(e)}")
+
+    async def cmd_movies(self, interaction: discord.Interaction):
+        await interaction.response.defer()
+        try:
+            all_movies = await get_all_movies(self.algolia_client, self.algolia_movies_index_name)
+            if not all_movies:
+                await interaction.followup.send("No movies added yet! Use `/add`.")
+                return
+
+            movies_per_page, detailed_count = 10, 5
+            view = MoviesPaginationView(self, interaction.user.id, all_movies, movies_per_page, detailed_count)
+            embed = await self._get_movies_page_embed(all_movies, view.current_page, movies_per_page, detailed_count,
+                                                      view.total_pages)
+            await view.update_buttons()
+            message = await interaction.followup.send(embed=embed, view=view)
+            view.message = message
+        except Exception as e:
+            logger.error(f"Error in /movies: {e}", exc_info=True)
+            await interaction.followup.send("Error getting movies.")
+
+    async def _get_movies_page_embed(self, all_movies: List[Dict[str, Any]], current_page: int, movies_per_page: int,
+                                     detailed_count: int, total_pages: int) -> discord.Embed:
+        start_index = current_page * movies_per_page
+        end_index = start_index + movies_per_page
+        page_movies = all_movies[start_index:end_index]
+        embed = discord.Embed(title=f"🎬 Paradiso Movies (Page {current_page + 1}/{total_pages})", color=0x03a9f4)
+        for i, movie in enumerate(page_movies):
+            title = movie.get("title", "Unknown")
+            year_str = f" ({movie.get('year')})" if movie.get('year') else ""
+            votes = movie.get("votes", 0)
+            rating = movie.get("rating")
+            plot = movie.get("plot", "No description.")
+
+            name = f"{start_index + i + 1}. {title}{year_str}"
+            value = f"**Votes**: {votes} | **Rating**: {f'⭐ {rating}/10' if rating else 'N/A'}"
+            if i < detailed_count:
+                if plot and len(plot) > 100: plot = plot[:97] + "..."
+                value += f"\n*Plot*: {plot if plot else 'N/A'}"
+            embed.add_field(name=name, value=value, inline=False)
+        if page_movies and page_movies[0].get("image") and current_page == 0:
+            embed.set_thumbnail(url=page_movies[0]["image"])
+        embed.set_footer(text=f"Total movies: {len(all_movies)}")
+        return embed
+
+    async def cmd_search(self, interaction: discord.Interaction, query: str):
+        await interaction.response.defer()
+        try:
+            main_query, filter_string = parse_algolia_filters(query)
+            logger.info(f"Parsed Search: Query='{main_query}', Filters='{filter_string}'")
+
+            # V3 API: Simple index.search call with filters
+            index = self.algolia_client.init_index(self.algolia_movies_index_name)
+            search_params = {
+                'hitsPerPage': 5,
+                'attributesToRetrieve': ['*', 'objectID'],
+                'attributesToHighlight': ['title', 'director', 'actors', 'plot', 'genre'],
+                'attributesToSnippet': ['plot:20']
+            }
+
+            if filter_string:
+                search_params['filters'] = filter_string
+
+            search_response = index.search(main_query, search_params)
+
+            if search_response.get('nbHits', 0) == 0:
+                await interaction.followup.send(f"No results found for '{query}'.")
+                return
+
+            await send_search_results_embed(interaction.followup, query, search_response.get('hits', []),
+                                            search_response.get('nbHits', 0))
+
+        except Exception as e:
+            logger.error(f"Error in /search command: {e}", exc_info=True)
+            await interaction.followup.send(f"❌ Error searching: {str(e)}")
+
+    async def cmd_recommend(self, interaction: discord.Interaction, movie_title: str, count: int = 5):
+        """Get movie recommendations based on a reference movie."""
+        await interaction.response.defer(thinking=True)
+        try:
+            # Find the reference movie
+            reference_movie = await find_movie_by_title(self.algolia_client, self.algolia_movies_index_name,
+                                                        movie_title)
+            if not reference_movie:
+                await interaction.followup.send(f"❌ Could not find '{movie_title}' to base recommendations on.")
+                return
+
+            # Get recommendations using Algolia's related-products model
+            recommendations = await get_recommendations(
+                self.algolia_client,
+                self.algolia_movies_index_name,
+                reference_movie['objectID'],
+                model="related",
+                count=count
+            )
+
+            if not recommendations:
+                await interaction.followup.send(f"❌ No recommendations found for '{reference_movie['title']}'.")
+                return
+
+            # Create recommendation embed
+            embed = discord.Embed(
+                title=f"🎬 Movies like '{reference_movie['title']}'",
+                description=f"Found {len(recommendations)} recommendations based on content and user engagement",
+                color=0x00ff00
+            )
+
+            # Add reference movie info
+            embed.add_field(
+                name="📌 Reference Movie",
+                value=f"{reference_movie.get('title')} ({reference_movie.get('year', 'N/A')})",
+                inline=False
+            )
+
+            # Add recommendations
+            for i, movie in enumerate(recommendations):
+                value_parts = []
+                if movie.get('director'):
+                    value_parts.append(f"Director: {movie['director']}")
+                if movie.get('genre'):
+                    value_parts.append(f"Genre: {', '.join(movie['genre'][:2])}")
+                if movie.get('votes') is not None:
+                    value_parts.append(f"Votes: {movie['votes']}")
+                if movie.get('rating'):
+                    value_parts.append(f"Rating: ⭐{movie['rating']}/10")
+
+                embed.add_field(
+                    name=f"{i + 1}. {movie.get('title', 'Unknown')} ({movie.get('year', 'N/A')})",
+                    value="\n".join(value_parts) if value_parts else "No additional info",
+                    inline=False
+                )
+
+            if reference_movie.get('image'):
+                embed.set_thumbnail(url=reference_movie['image'])
+
+            embed.set_footer(text=f"Recommendations powered by Algolia • Use /vote to vote for these movies")
+            await interaction.followup.send(embed=embed)
+
+        except Exception as e:
+            logger.error(f"Error in /recommend: {e}", exc_info=True)
+            await interaction.followup.send(f"❌ Error getting recommendations: {str(e)}")
+
+    async def cmd_lookalike(self, interaction: discord.Interaction, movie_title: str, count: int = 5):
+        """Get visually similar movies based on poster/image."""
+        await interaction.response.defer(thinking=True)
+        try:
+            # Find the reference movie
+            reference_movie = await find_movie_by_title(self.algolia_client, self.algolia_movies_index_name,
+                                                        movie_title)
+            if not reference_movie:
+                await interaction.followup.send(f"❌ Could not find '{movie_title}' to find visual similarities.")
+                return
+
+            if not reference_movie.get('image'):
+                await interaction.followup.send(
+                    f"❌ '{reference_movie['title']}' has no poster image for visual comparison.")
+                return
+
+            # Get visually similar movies using Algolia's looking-similar model
+            similar_movies = await get_recommendations(
+                self.algolia_client,
+                self.algolia_movies_index_name,
+                reference_movie['objectID'],
+                model="similar",
+                count=count
+            )
+
+            if not similar_movies:
+                await interaction.followup.send(f"❌ No visually similar movies found for '{reference_movie['title']}'.")
+                return
+
+            # Create visual similarity embed
+            embed = discord.Embed(
+                title=f"🎨 Movies visually similar to '{reference_movie['title']}'",
+                description=f"Found {len(similar_movies)} visually similar movies",
+                color=0x9370DB
+            )
+
+            # Add reference movie info with image
+            embed.add_field(
+                name="📌 Reference Movie",
+                value=f"{reference_movie.get('title')} ({reference_movie.get('year', 'N/A')})",
+                inline=False
+            )
+            embed.set_thumbnail(url=reference_movie['image'])
+
+            # Add similar movies with image preview
+            for i, movie in enumerate(similar_movies):
+                value_parts = []
+                if movie.get('image'):
+                    value_parts.append(f"[View Poster]({movie['image']})")
+                if movie.get('votes') is not None:
+                    value_parts.append(f"Votes: {movie['votes']}")
+                if movie.get('genre'):
+                    value_parts.append(f"Genre: {', '.join(movie['genre'][:2])}")
+
+                embed.add_field(
+                    name=f"{i + 1}. {movie.get('title', 'Unknown')} ({movie.get('year', 'N/A')})",
+                    value="\n".join(value_parts) if value_parts else "No additional info",
+                    inline=False
+                )
+
+            embed.set_footer(text=f"Visual similarity powered by Algolia • Use /vote to vote for these movies")
+            await interaction.followup.send(embed=embed)
+
+        except Exception as e:
+            logger.error(f"Error in /lookalike: {e}", exc_info=True)
+            await interaction.followup.send(f"❌ Error finding visually similar movies: {str(e)}")
+
+    async def cmd_top(self, interaction: discord.Interaction, count: app_commands.Range[int, 1, 20] = 5):
+        await interaction.response.defer(thinking=True)
+        try:
+            top_movies = await get_top_movies(self.algolia_client, self.algolia_movies_index_name, count)
+            if not top_movies:
+                await interaction.followup.send("❌ No movies with votes yet! Start voting to see results.")
+                return
+            embed = discord.Embed(title=f"🏆 Top {len(top_movies)} Voted Movies", color=0x00ff00)
+            for i, movie in enumerate(top_movies):
+                medal = "🥇🥈🥉"[i] if i < 3 else f"{i + 1}."
+                details = [f"**Votes**: {movie.get('votes', 0)}", f"**Year**: {movie.get('year', 'N/A')}"]
+                if movie.get("rating"): details.append(f"**Rating**: ⭐ {movie['rating']}/10")
+                embed.add_field(name=f"{medal} {movie.get('title', 'N/A')}", value="\n".join(details), inline=False)
+            await interaction.followup.send(embed=embed)
+        except Exception as e:
+            logger.error(f"Error in /top: {e}", exc_info=True)
+            await interaction.followup.send(f"❌ Error: {str(e)}")
+
+    async def cmd_info(self, interaction: discord.Interaction, query: str):
+        await interaction.response.defer(thinking=True)
+        try:
+            movie = await find_movie_by_title(self.algolia_client, self.algolia_movies_index_name, query)
+            if not movie:
+                await interaction.followup.send(f"Could not find '{query}'. Use `/search`.")
+                return
+            await send_detailed_movie_embed(interaction.followup, movie)
+        except Exception as e:
+            logger.error(f"Error in /info: {e}", exc_info=True)
+            await interaction.followup.send(f"❌ Error fetching info: {str(e)}")
 
     async def cmd_random(self, interaction: discord.Interaction):
         """Slash command to get a random movie."""
@@ -344,203 +930,15 @@ class ParadisoBot:
             logger.error(f"Error in /random command: {e}", exc_info=True)
             await interaction.followup.send(f"❌ An error occurred while fetching a random movie: {str(e)}")
 
-    async def cmd_recommend(self, interaction: discord.Interaction, movie_title: str, count: int = 5):
-        """Get movie recommendations based on a reference movie."""
-        await interaction.response.defer(thinking=True)
-        try:
-            # Find the reference movie
-            reference_movie = await find_movie_by_title(self.algolia_client, self.algolia_movies_index_name,
-                                                        movie_title)
-            if not reference_movie:
-                await interaction.followup.send(f"❌ Could not find '{movie_title}' to base recommendations on.")
-                return
-
-            # Get recommendations using Algolia's recommendation API
-            # Note: This is a simplified version. For production, you'd use the Algolia Recommend API
-            # For now, we'll use similarity search based on attributes
-
-            # Search for similar movies based on director and genre
-            index = self.algolia_client.init_index(self.algolia_movies_index_name)
-
-            # Build filter for similar attributes
-            filters = []
-            if reference_movie.get('director'):
-                filters.append(f"director:\"{reference_movie['director']}\"")
-            if reference_movie.get('genre'):
-                genre_filter = ' OR '.join([f"genre:\"{g}\"" for g in reference_movie['genre'][:2]])
-                if genre_filter:
-                    filters.append(f"({genre_filter})")
-
-            # Add year range filter (movies within 5 years)
-            if reference_movie.get('year'):
-                year = reference_movie['year']
-                filters.append(f"year:{year - 5} TO {year + 5}")
-
-            combined_filter = ' AND '.join(filters) if filters else None
-
-            search_response = index.search('', {
-                'hitsPerPage': count + 5,  # Get extra to filter out the original
-                'filters': combined_filter,
-                'attributesToRetrieve': ['*']
-            })
-
-            # Filter out the original movie
-            recommendations = []
-            for hit in search_response.get('hits', []):
-                if hit['objectID'] != reference_movie['objectID']:
-                    recommendations.append(hit)
-                    if len(recommendations) >= count:
-                        break
-
-            if not recommendations:
-                await interaction.followup.send(f"❌ No recommendations found for '{reference_movie['title']}'.")
-                return
-
-            # Create recommendation embed
-            embed = discord.Embed(
-                title=f"🎬 Movies like '{reference_movie['title']}'",
-                description=f"Based on director and genre similarities",
-                color=0x00ff00
-            )
-
-            # Add reference movie info
-            embed.add_field(
-                name="📌 Reference Movie",
-                value=f"{reference_movie.get('title')} ({reference_movie.get('year', 'N/A')})",
-                inline=False
-            )
-
-            # Add recommendations
-            for i, movie in enumerate(recommendations):
-                value_parts = []
-                if movie.get('director'):
-                    value_parts.append(f"Director: {movie['director']}")
-                if movie.get('genre'):
-                    value_parts.append(f"Genre: {', '.join(movie['genre'][:2])}")
-                if movie.get('votes') is not None:
-                    value_parts.append(f"Votes: {movie['votes']}")
-
-                embed.add_field(
-                    name=f"{i + 1}. {movie.get('title', 'Unknown')} ({movie.get('year', 'N/A')})",
-                    value="\n".join(value_parts) if value_parts else "No additional info",
-                    inline=False
-                )
-
-            if reference_movie.get('image'):
-                embed.set_thumbnail(url=reference_movie['image'])
-
-            embed.set_footer(text=f"Powered by Paradiso • Use /vote to vote for these movies")
-            await interaction.followup.send(embed=embed)
-
-        except Exception as e:
-            logger.error(f"Error in /recommend: {e}", exc_info=True)
-            await interaction.followup.send(f"❌ Error getting recommendations: {str(e)}")
-
-    async def cmd_lookalike(self, interaction: discord.Interaction, movie_title: str, count: int = 5):
-        """Get visually similar movies based on poster/image."""
-        await interaction.response.defer(thinking=True)
-        try:
-            # Find the reference movie
-            reference_movie = await find_movie_by_title(self.algolia_client, self.algolia_movies_index_name,
-                                                        movie_title)
-            if not reference_movie:
-                await interaction.followup.send(f"❌ Could not find '{movie_title}' to find visual similarities.")
-                return
-
-            if not reference_movie.get('image'):
-                await interaction.followup.send(
-                    f"❌ '{reference_movie['title']}' has no poster image for visual comparison.")
-                return
-
-            # Get visually similar movies
-            # Note: This is a simplified version. For production, you'd use Algolia's Visual Search API
-            # For now, we'll search for movies with similar attributes and posters
-
-            index = self.algolia_client.init_index(self.algolia_movies_index_name)
-
-            # Search for movies with images, similar genre, and year range
-            filters = ["image:*"]  # Must have an image
-
-            if reference_movie.get('genre'):
-                genre_filter = ' OR '.join([f"genre:\"{g}\"" for g in reference_movie['genre']])
-                if genre_filter:
-                    filters.append(f"({genre_filter})")
-
-            combined_filter = ' AND '.join(filters)
-
-            search_response = index.search('', {
-                'hitsPerPage': count + 5,  # Get extra to filter out the original
-                'filters': combined_filter,
-                'attributesToRetrieve': ['*']
-            })
-
-            # Filter out the original movie
-            similar_movies = []
-            for hit in search_response.get('hits', []):
-                if hit['objectID'] != reference_movie['objectID'] and hit.get('image'):
-                    similar_movies.append(hit)
-                    if len(similar_movies) >= count:
-                        break
-
-            if not similar_movies:
-                await interaction.followup.send(f"❌ No visually similar movies found for '{reference_movie['title']}'.")
-                return
-
-            # Create visual similarity embed
-            embed = discord.Embed(
-                title=f"🎨 Movies visually similar to '{reference_movie['title']}'",
-                description=f"Based on poster and genre similarities",
-                color=0x9370DB
-            )
-
-            # Add reference movie info with image
-            embed.add_field(
-                name="📌 Reference Movie",
-                value=f"{reference_movie.get('title')} ({reference_movie.get('year', 'N/A')})",
-                inline=False
-            )
-            embed.set_thumbnail(url=reference_movie['image'])
-
-            # Add similar movies with image preview
-            for i, movie in enumerate(similar_movies):
-                value_parts = [f"[View Poster]({movie['image']})"]
-                if movie.get('votes') is not None:
-                    value_parts.append(f"Votes: {movie['votes']}")
-
-                embed.add_field(
-                    name=f"{i + 1}. {movie.get('title', 'Unknown')} ({movie.get('year', 'N/A')})",
-                    value="\n".join(value_parts),
-                    inline=False
-                )
-
-            embed.set_footer(text=f"Powered by Paradiso • Use /vote to vote for these movies")
-            await interaction.followup.send(embed=embed)
-
-        except Exception as e:
-            logger.error(f"Error in /lookalike: {e}", exc_info=True)
-            await interaction.followup.send(f"❌ Error finding visually similar movies: {str(e)}")
-
-    # ... (rest of the slash commands remain similar)
-
-    async def cmd_top(self, interaction: discord.Interaction, count: app_commands.Range[int, 1, 20] = 5):
-        await interaction.response.defer(thinking=True)
-        try:
-            top_movies = await get_top_movies(self.algolia_client, self.algolia_movies_index_name, count)
-            if not top_movies:
-                await interaction.followup.send("❌ No movies with votes yet! Start voting to see results.")
-                return
-            embed = discord.Embed(title=f"🏆 Top {len(top_movies)} Voted Movies", color=0x00ff00)
-            for i, movie in enumerate(top_movies):
-                medal = "🥇🥈🥉"[i] if i < 3 else f"{i + 1}."
-                details = [f"**Votes**: {movie.get('votes', 0)}", f"**Year**: {movie.get('year', 'N/A')}"]
-                if movie.get("rating"): details.append(f"**Rating**: ⭐ {movie['rating']}/10")
-                embed.add_field(name=f"{medal} {movie.get('title', 'N/A')}", value="\n".join(details), inline=False)
-            await interaction.followup.send(embed=embed)
-        except Exception as e:
-            logger.error(f"Error in /top: {e}", exc_info=True)
-            await interaction.followup.send(f"❌ Error: {str(e)}")
-
-    # ... (other commands remain similar)
+    async def cmd_help(self, interaction: discord.Interaction):
+        embed = discord.Embed(title="👋 Paradiso Bot Help", color=0x03a9f4)
+        embed.add_field(name="Basic Commands", value="`/add` `/vote` `/movies` `/top` `/random`", inline=False)
+        embed.add_field(name="Search & Discover", value="`/search` `/info` `/recommend` `/lookalike`", inline=False)
+        embed.add_field(name="How Recommendations Work",
+                        value="• `/recommend` - Similar movies based on content & user behavior\n• `/lookalike` - Visually similar movies based on posters",
+                        inline=False)
+        embed.set_footer(text="Use /help <command> for detailed help on a specific command")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 def main():

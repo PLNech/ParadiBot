@@ -14,10 +14,12 @@ from utils.embed_formatters import format_movie_embed
 
 logger = logging.getLogger("paradiso_bot")
 
+
 class MovieAddConfirmView(View):
     """View for confirming movie addition when similar movies exist."""
 
-    def __init__(self, bot_instance, movie_data: Dict[str, Any], existing_movies: List[Dict[str, Any]], interaction: discord.Interaction):
+    def __init__(self, bot_instance, movie_data: Dict[str, Any], existing_movies: List[Dict[str, Any]],
+                 interaction: discord.Interaction):
         super().__init__(timeout=60)
         self.bot = bot_instance
         self.movie_data = movie_data
@@ -147,11 +149,14 @@ class MovieAddModal(Modal, title="Add Movie to Paradiso"):
 
             # Process other inputs
             director = self.director_input.value.strip() if self.director_input.value else None
-            actors = [a.strip() for a in self.actors_input.value.split(',') if a.strip()] if self.actors_input.value else []
-            genres = [g.strip() for g in self.genre_input.value.split(',') if g.strip()] if self.genre_input.value else []
+            actors = [a.strip() for a in self.actors_input.value.split(',') if
+                      a.strip()] if self.actors_input.value else []
+            genres = [g.strip() for g in self.genre_input.value.split(',') if
+                      g.strip()] if self.genre_input.value else []
 
             # Check if the movie already exists (exact title+year match)
-            existing_movie = await _check_movie_exists(self.bot.algolia_client, self.bot.algolia_movies_index_name, title, year)
+            existing_movie = await _check_movie_exists(self.bot.algolia_client, self.bot.algolia_movies_index_name,
+                                                       title, year)
 
             if existing_movie:
                 await interaction.followup.send(
@@ -205,7 +210,7 @@ class MovieAddModal(Modal, title="Add Movie to Paradiso"):
 
                 for i, movie in enumerate(similar_movies):
                     embed.add_field(
-                        name=f"{i+1}. {movie['title']} ({movie.get('year', 'N/A')})",
+                        name=f"{i + 1}. {movie['title']} ({movie.get('year', 'N/A')})",
                         value=f"Votes: {movie.get('votes', 0)}",
                         inline=False
                     )
@@ -227,18 +232,18 @@ class MovieAddModal(Modal, title="Add Movie to Paradiso"):
                 )
 
                 logger.info(f"Added movie via modal: {title} ({movie_data['objectID']})")
-        
+
         except Exception as e:
             logger.error(f"Error adding movie via modal: {e}", exc_info=True)
             await interaction.followup.send(
                 f"❌ An error occurred while adding the movie: {str(e)}",
                 ephemeral=True
             )
-    
+
     async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
         """Handle errors during modal submission."""
         logger.error(f"Error in movie add modal: {error}", exc_info=True)
-        
+
         if interaction.response.is_done():
             await interaction.followup.send(
                 "❌ An error occurred while processing your submission. Please try again.",

@@ -404,3 +404,147 @@ async def get_random_movie(client: SearchClient, index_name: str, last_shown: Li
     except Exception as e:
         logger.error(f"Error getting random movie: {e}", exc_info=True)
         return None
+
+
+# Recommendation functions using Algolia v3 Recommend API
+async def get_related_products(client: SearchClient, index_name: str, object_id: str, count: int = 5) -> List[
+    Dict[str, Any]]:
+    """Get related movies using Algolia's related-products model."""
+    try:
+        # For v3, we need to access the recommendation client through the main client
+        # Search client is separate from recommend client in v3
+        recommendations = client.init_index(index_name).get_related_products([{
+            'indexName': index_name,
+            'objectID': object_id,
+            'maxRecommendations': count,
+            'threshold': 0
+        }])
+
+        # Extract hits from the response
+        if recommendations and 'results' in recommendations and len(recommendations['results']) > 0:
+            return recommendations['results'][0].get('hits', [])
+
+        return []
+
+    except Exception as e:
+        logger.error(f"Error getting related products for {object_id}: {e}", exc_info=True)
+        return []
+
+
+async def get_looking_similar(client: SearchClient, index_name: str, object_id: str, count: int = 5) -> List[
+    Dict[str, Any]]:
+    """Get visually similar movies using Algolia's looking-similar model."""
+    try:
+        # For v3, we need to access the recommendation client through the main client
+        recommendations = client.init_index(index_name).get_similar_products([{
+            'indexName': index_name,
+            'objectID': object_id,
+            'maxRecommendations': count,
+            'threshold': 0
+        }])
+
+        # Extract hits from the response
+        if recommendations and 'results' in recommendations and len(recommendations['results']) > 0:
+            return recommendations['results'][0].get('hits', [])
+
+        return []
+
+    except Exception as e:
+        logger.error(f"Error getting visually similar products for {object_id}: {e}", exc_info=True)
+        return []
+
+
+async def get_recommendations(client: SearchClient, index_name: str, object_id: str, model: str = "related",
+                              count: int = 5) -> List[Dict[str, Any]]:
+    """Unified function to get recommendations using specified model."""
+    try:
+        # For v3, we can simulate the recommendations using search with filters
+        # This is a fallback approach for simpler deployment
+
+        reference_movie = await get_movie_by_id(client, index_name, object_id)
+        if not reference_movie:
+            return []
+
+        # Build filters based on the model type
+        if model == "related":
+            # Use related products if available, otherwise fallback to attribute search
+            try:
+                return await get_related_products(client, index_name, object_id, count)
+            except Exception:
+                # Fallback to attribute-based search
+                director = reference_movie.get('director')
+                genres = reference_movie.get('genre', [])
+                year = reference_movie.get('year')
+
+                filters = []
+                if director:
+                    filters.append(f'director:"{director}"')
+                if genres:
+                    genre_filters = [f'genre:"{g}"' for g in genres[:2]]
+                    if genre_filters:
+                        filters.append('(' + ' OR '.join(genre_filters) + ')')
+                if year:
+                    filters.append(f'year:{year - 5} TO {year + 5}')
+
+                filter_string = ' AND '.join(filters) if filters else None
+
+                index = client.init_index(index_name)
+                response = index.search('', {
+                    'filters': filter_string,
+                    'hitsPerPage': count + 10,  # Get more to filter out the original
+                    'attributesToRetrieve': ['*']
+                })
+
+                # Filter out the original movie and return the rest
+                recommendations = []
+                for hit in response.get('hits', []):
+                    if hit['objectID'] != object_id:
+                        recommendations.append(hit)
+                        if len(recommendations) >= count:
+                            break
+
+                return recommendations
+
+        elif model == "similar":
+            # Use looking-similar if available, otherwise fallback to image-based search
+            try:
+                return await get_looking_similar(client, index_name, object_id, count)
+            except Exception:
+                # Fallback to searching movies with images in similar genre
+                if not reference_movie.get('image'):
+                    return []
+
+                genres = reference_movie.get('genre', [])
+                filters = ['image:*']  # Must have an image
+
+                if genres:
+                    genre_filters = [f'genre:"{g}"' for g in genres]
+                    if genre_filters:
+                        filters.append('(' + ' OR '.join(genre_filters) + ')')
+
+                filter_string = ' AND '.join(filters)
+
+                index = client.init_index(index_name)
+                response = index.search('', {
+                    'filters': filter_string,
+                    'hitsPerPage': count + 10,  # Get more to filter out the original
+                    'attributesToRetrieve': ['*']
+                })
+
+                # Filter out the original movie and return the rest
+                recommendations = []
+                for hit in response.get('hits', []):
+                    if hit['objectID'] != object_id and hit.get('image'):
+                        recommendations.append(hit)
+                        if len(recommendations) >= count:
+                            break
+
+                return recommendations
+
+        else:
+            logger.warning(f"Unknown recommendation model: {model}")
+            return []
+
+    except Exception as e:
+        logger.error(f"Error getting recommendations with model '{model}' for {object_id}: {e}", exc_info=True)
+        return []
