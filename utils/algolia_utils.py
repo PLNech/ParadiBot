@@ -5,8 +5,6 @@ import logging
 from typing import List, Dict, Any, Optional, Union, Tuple
 
 from algoliasearch.search.client import SearchClient
-from algoliasearch.search.models.search_response import SearchResponse
-from algoliasearch.search.models.search_responses import SearchResponses
 
 # For browse_objects, the specific response type might not be explicitly needed for simple iteration
 # from algoliasearch.search.models.browse_response import BrowseResponse # Not strictly necessary for current usage
@@ -56,13 +54,13 @@ async def _check_movie_exists(client: SearchClient, index_name: str, title: str)
             ]
         }
 
-        search_response: SearchResponses = await client.search(search_method_params=search_params_payload)
+        search_response = await client.search(search_method_params=search_params_payload)
         # For multi-search, results is a list. We expect one result here.
         if not search_response.results or len(search_response.results) == 0:
             logger.warning(f"No results array from Algolia for _check_movie_exists with title '{title}'")
             return None
 
-        search_result: SearchResponse = search_response.results[0]
+        search_result = search_response.results[0]
 
         if search_result.nb_hits == 0:  # nb_hits in v4
             return None
@@ -71,10 +69,10 @@ async def _check_movie_exists(client: SearchClient, index_name: str, title: str)
             title_highlight = hit.get("_highlightResult", {}).get("title", {})
             if title_highlight.get('matchLevel') == 'full':
                 logger.info(f"Existing movie check: Found full title match for '{title}': {hit['objectID']}")
-                return hit
+                return hit.model_dump()
             if hit.get("title", "").lower() == title.lower():
                 logger.info(f"Existing movie check: Found exact string match for '{title}': {hit['objectID']}")
-                return hit
+                return hit.model_dump()
 
         logger.info(f"Existing movie check: No strong title match for '{title}' among top hits.")
         return None
@@ -115,12 +113,12 @@ async def vote_for_movie(client: SearchClient, movies_index_name: str, votes_ind
             ]
         }
 
-        search_response: SearchResponses = await client.search(search_method_params=search_params_payload)
+        search_response = await client.search(search_method_params=search_params_payload)
         if not search_response.results or len(search_response.results) == 0:
             logger.error(f"No results array from Algolia for vote check for movie {movie_id}, user {user_id}")
             return False, "Error checking existing vote"
 
-        search_result: SearchResponse = search_response.results[0]
+        search_result = search_response.results[0]
 
         if search_result.nb_hits > 0:
             logger.info(f"User {user_id} ({user_token[:8]}...) already voted for movie {movie_id}.")
@@ -249,12 +247,12 @@ async def find_movie_by_title(client: SearchClient, index_name: str, title: str)
             ]
         }
 
-        search_response: SearchResponses = await client.search(search_method_params=search_params_payload)
+        search_response = await client.search(search_method_params=search_params_payload)
         if not search_response.results or len(search_response.results) == 0:
             logger.warning(f"No results array from Algolia for find_movie_by_title with title '{title}'")
             return None
 
-        search_result: SearchResponse = search_response.results[0]
+        search_result = search_response.results[0]
 
         if search_result.nb_hits == 0:
             return None
@@ -310,12 +308,12 @@ async def search_movies_for_vote(client: SearchClient, index_name: str, title: s
             ]
         }
 
-        search_responses_obj: SearchResponses = await client.search(search_method_params=search_params_payload)
+        search_responses_obj = await client.search(search_method_params=search_params_payload)
         if not search_responses_obj.results or len(search_responses_obj.results) == 0:
             logger.warning(f"No results array from Algolia for search_movies_for_vote with title '{title}'")
             return {"hits": [], "nbHits": 0}
 
-        search_result: SearchResponse = search_responses_obj.results[0]
+        search_result = search_responses_obj.results[0]
 
         logger.info(f"Vote search for '{title}' found {search_result.nb_hits} hits.")
         # search_result.hits are already dictionaries
@@ -347,12 +345,12 @@ async def get_top_movies(client: SearchClient, index_name: str, count: int = 5) 
             ]
         }
 
-        search_response: SearchResponses = await client.search(search_method_params=search_params_payload)
+        search_response = await client.search(search_method_params=search_params_payload)
         if not search_response.results or len(search_response.results) == 0:
             logger.warning(f"No results array from Algolia for get_top_movies")
             return []
 
-        search_result: SearchResponse = search_response.results[0]
+        search_result = search_response.results[0]
 
         # Hits are already sorted by Algolia based on ranking formula (which should include votes)
         # If you need to be absolutely sure or apply a secondary sort in Python:

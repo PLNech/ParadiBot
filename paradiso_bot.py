@@ -34,8 +34,6 @@ from typing import List, Dict, Any, Optional, Union
 import discord
 from algoliasearch.recommend.client import RecommendClient
 from algoliasearch.search.client import SearchClient
-from algoliasearch.search.models import SearchResponse as AlgoliaSearchResponse  # For type hinting
-from algoliasearch.search.models import SearchResponses as AlgoliaSearchResponses  # For type hinting
 from discord import app_commands
 from dotenv import load_dotenv
 
@@ -303,14 +301,14 @@ class ParadisoBot:
                     }
                 ]
             }
-            search_response: AlgoliaSearchResponses = await self.algolia_client.search(
+            search_response = await self.algolia_client.search(
                 search_method_params=search_request_payload)
 
             if not search_response.results:
                 await channel.send(f"No results found for '{query}'.")
                 return
 
-            search_result: AlgoliaSearchResponse = search_response.results[0]
+            search_result = search_response.results[0]
             await send_search_results_embed(channel, query, search_result.hits, search_result.nb_hits)
 
         except Exception as e:
@@ -345,9 +343,9 @@ class ParadisoBot:
                     }
                 ]
             }
-            search_response: AlgoliaSearchResponses = await self.algolia_client.search(
+            search_response = await self.algolia_client.search(
                 search_method_params=search_request_payload)
-            search_results: AlgoliaSearchResponse = search_response.results[0] if search_response.results else None
+            search_results = search_response.results[0] if search_response.results else None
 
             dm_channel = await message.author.create_dm()
             if search_results and search_results.nb_hits > 0:
@@ -536,7 +534,7 @@ class ParadisoBot:
                     "params": {"filters": "votes = 0", "hitsPerPage": 0, "analytics": False}
                 }]
             }
-            count_response: AlgoliaSearchResponses = await self.algolia_client.search(
+            count_response = await self.algolia_client.search(
                 search_method_params=count_payload)
             if not count_response.results or count_response.results[0].nb_hits == 0:
                 await channel.send("🎉 No unvoted movies found! Everything has at least one vote or the queue is empty.")
@@ -558,7 +556,7 @@ class ParadisoBot:
                     }
                 }]
             }
-            movie_response: AlgoliaSearchResponses = await self.algolia_client.search(
+            movie_response = await self.algolia_client.search(
                 search_method_params=fetch_payload)
             if not movie_response.results or not movie_response.results[0].hits:
                 await channel.send("🤔 Couldn't fetch a random unvoted movie, though some exist. Please try again.")
@@ -706,14 +704,14 @@ class ParadisoBot:
                     }
                 ]
             }
-            search_response: AlgoliaSearchResponses = await self.algolia_client.search(
+            search_response = await self.algolia_client.search(
                 search_method_params=search_request_payload)
 
             if not search_response.results:
                 await interaction.followup.send(f"No results found for '{query}'.")
                 return
 
-            search_result: AlgoliaSearchResponse = search_response.results[0]
+            search_result = search_response.results[0]
             await send_search_results_embed(interaction.followup, query, search_result.hits, search_result.nb_hits)
 
         except Exception as e:
@@ -833,7 +831,7 @@ class ParadisoBot:
                     }
                 }]
             }
-            count_response: AlgoliaSearchResponses = await self.algolia_client.search(
+            count_response = await self.algolia_client.search(
                 search_method_params=count_payload)
 
             if not count_response.results or count_response.results[0].nb_hits == 0:
@@ -859,7 +857,7 @@ class ParadisoBot:
                     }
                 }]
             }
-            movie_response: AlgoliaSearchResponses = await self.algolia_client.search(
+            movie_response = await self.algolia_client.search(
                 search_method_params=fetch_payload)
 
             if not movie_response.results or not movie_response.results[0].hits:
