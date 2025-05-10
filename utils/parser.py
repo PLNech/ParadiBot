@@ -13,112 +13,65 @@ def parse_algolia_filters(query_string: str) -> Tuple[str, str]:
     """
     Parse a query string that may contain filter expressions.
     
-    Returns:
-        Tuple of (main_query, filter_string)
-        
     Supported filter syntax:
-    - key:value (equals)
-    - key:"multi word value" (equals with spaces)
-    - key:>value (greater than)
-    - key:>=value (greater than or equal)
-    - key:<value (less than)
-    - key:<=value (less than or equal)
-    - key>value (alternative greater than)
-    - key>=value (alternative greater than or equal)
-    - key<value (alternative less than)
-    - key<=value (alternative less than or equal)
-    
-    Example: "action movies year>2010 rating:>7.5 director:\"Christopher Nolan\""
+    - actor:name or actors:name
+    - director:name
+    - year:value or year>value or year<value
+    - genre:name
     """
     if not query_string:
         return "", ""
     
-    # Separate main query from filter expressions
-    # Regex to match filter patterns: key:value, key:"multi word", key:>value, etc.
-    filter_pattern = r'(\w+)(?::|\s*[><]=?\s*)(?:"([^"]+)"|([^\s]+))'
-    
-    # Find all filter expressions
-    filter_matches = re.finditer(filter_pattern, query_string)
+    # Regex to match various filter patterns
+    filter_patterns = [
+        r'(?:actor|actors):\s*(["\']?)([^"\'\s]+(?:\s+[^"\'\s]+)*)\1',  # actor patterns
+        r'director:\s*(["\']?)([^"\'\s]+(?:\s+[^"\'\s]+)*)\1',          # director pattern
+        r'year\s*([><]=?)\s*(\d+)',                                    # year with operators
+        r'year:\s*(\d+)',                                              # year exact match
+        r'genre:\s*(["\']?)([^"\'\s]+(?:\s+[^"\'\s]+)*)\1'             # genre pattern
+    ]
     
     filters = []
-    for match in filter_matches:
-        key = match.group(1).lower()
-        # Get operator from the match
-        operator = ""
-        if ":>" in match.group(0):
-            operator = ">"
-        elif ":<" in match.group(0):
-            operator = "<"
-        elif ":>=" in match.group(0):
-            operator = ">="
-        elif ":<=" in match.group(0):
-            operator = "<="
-        elif ">" in match.group(0) and ":" not in match.group(0):
-            operator = ">"
-        elif ">=" in match.group(0) and ":" not in match.group(0):
-            operator = ">="
-        elif "<" in match.group(0) and ":" not in match.group(0):
-            operator = "<"
-        elif "<=" in match.group(0) and ":" not in match.group(0):
-            operator = "<="
-        
-        # Get the value (either from quoted group or non-quoted)
-        value = match.group(2) if match.group(2) else match.group(3)
-        
-        # Clean up the value if it contains an operator
-        if not operator and (value.startswith(">") or value.startswith("<")):
-            # Handle case where operator is in the value part (e.g., key:>5)
-            if value.startswith(">="):
-                operator = ">="
-                value = value[2:]
-            elif value.startswith("<="):
-                operator = "<="
-                value = value[2:]
-            elif value.startswith(">"):
-                operator = ">"
-                value = value[1:]
-            elif value.startswith("<"):
-                operator = "<"
-                value = value[1:]
-        
-        # Default operator is equality
-        if not operator:
-            operator = "="
-        
-        # Special handling for numeric fields
-        if key in ["year", "votes", "rating"]:
-            try:
-                float_value = float(value)
-                # Use numeric comparison
-                filters.append(f"{key} {operator} {float_value}")
-            except ValueError:
-                # Not a number, use string equality (likely won't match)
-                filters.append(f"{key} {operator} \"{value}\"")
-        elif key == "genre" or key == "actor" or key == "director":
-            # These are typically array fields or text fields that need string matching
-            value_quoted = f"\"{value}\""
-            if operator == "=":
-                filters.append(f"{key}:{value_quoted}")
-            else:
-                # Not a typical operation for these fields, but allow it
-                filters.append(f"{key} {operator} {value_quoted}")
-        else:
-            # Default handling for other fields
-            value_quoted = f"\"{value}\""
-            if operator == "=":
-                filters.append(f"{key}:{value_quoted}")
-            else:
-                filters.append(f"{key} {operator} {value_quoted}")
-    
-    # Remove filter expressions from the main query
     main_query = query_string
-    for match in re.finditer(filter_pattern, query_string):
-        main_query = main_query.replace(match.group(0), "")
     
-    # Clean up main query (remove extra spaces)
+    # Process each filter pattern
+    for pattern in filter_patterns:
+        matches = list(re.finditer(pattern, query_string, re.IGNORECASE))
+        for match in matches:
+            # Remove the matched filter from the main query
+            main_query = main_query.replace(match.group(0), '', 1)
+            
+            if 'actor' in match.group(0).lower():
+                # Handle actor/actors filter
+                actor_name = match.group(2).strip()
+                filters.append(f'actors:"{actor_name}"')
+                
+            elif 'director' in match.group(0).lower():
+                # Handle director filter  
+                director_name = match.group(2).strip()
+                filters.append(f'director:"{director_name}"')
+                
+            elif 'year' in match.group(0).lower():
+                # Handle year filter with operators
+                if len(match.groups()) == 2 and match.group(2).isdigit():
+                    # year with operator
+                    operator = match.group(1)
+                    year_value = match.group(2)
+                    filters.append(f'year {operator} {year_value}')
+                elif len(match.groups()) == 1 and match.group(1).isdigit():
+                    # year exact match
+                    year_value = match.group(1)
+                    filters.append(f'year:{year_value}')
+                    
+            elif 'genre' in match.group(0).lower():
+                # Handle genre filter
+                genre_name = match.group(2).strip()
+                filters.append(f'genre:"{genre_name}"')
+    
+    # Clean up main query
     main_query = " ".join(part for part in main_query.split() if part)
     
-    # Combine all filters with AND
+    # Combine all filters
     filter_string = " AND ".join(filters) if filters else ""
     
     logger.debug(f"Parsed '{query_string}' into query='{main_query}', filters='{filter_string}'")

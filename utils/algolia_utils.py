@@ -11,13 +11,12 @@ from algoliasearch.search_index import SearchIndex
 logger = logging.getLogger("paradiso_bot")
 
 
-# Helper function
+# Helper functions
 def generate_user_token(user_id: str) -> str:
     """Generate a consistent, non-reversible user token for Algolia from Discord user ID."""
     return hashlib.sha256(user_id.encode()).hexdigest()
 
 
-# Helper function
 def _is_float(value: Any) -> bool:
     """Helper to check if a value can be converted to a float."""
     if value is None:
@@ -27,6 +26,11 @@ def _is_float(value: Any) -> bool:
         return True
     except (ValueError, TypeError):
         return False
+
+def calculate_total_votes(movie: Dict[str, Any]) -> int:
+    """Calculate total votes from voted structure."""
+    voted = movie.get('voted', {})
+    return sum(len(users) for users in voted.values())
 
 
 # Algolia interaction methods using v3 API structure
@@ -104,13 +108,12 @@ async def add_movie_to_algolia(client: SearchClient, index_name: str, movie_data
         logger.error(f"Error adding movie to Algolia: {e}", exc_info=True)
         raise  # Re-raise the exception
 
-
-async def vote_for_movie(client: SearchClient, movies_index_name: str, votes_index_name: str,
-                         movie_id: str, user_id: str) -> Tuple[bool, Union[Dict[str, Any], str]]:
-    """Vote for a movie in Algolia."""
+async def vote_for_movie(search_client: SearchClient, movies_index_name: str, votes_index_name: str,
+                         movie_id: str, user_id: str, emoji_type: str = "thumb_up") -> Tuple[bool, Union[Dict[str, Any], str]]:
+    """Vote for a movie in Algolia with emoji-based voting."""
     try:
         user_token = generate_user_token(user_id)
-        votes_index = client.init_index(votes_index_name)
+        votes_index = search_client.init_index(votes_index_name)
 
         # Check if user already voted for this movie using the votes index
         search_response = votes_index.search('', {
@@ -119,63 +122,66 @@ async def vote_for_movie(client: SearchClient, movies_index_name: str, votes_ind
 
         if search_response.get('nbHits', 0) > 0:
             logger.info(f"User {user_id} ({user_token[:8]}...) already voted for movie {movie_id}.")
-            existing_movie = await get_movie_by_id(client, movies_index_name, movie_id)
+            existing_movie = await get_movie_by_id(search_client, movies_index_name, movie_id)
+            
+            # Check if they can change their vote (for future use)
             return False, existing_movie if existing_movie else "Already voted"
+
+        # Get the movie to check current votes
+        movie = await get_movie_by_id(search_client, movies_index_name, movie_id)
+        if not movie:
+            return False, "Movie not found"
+
+        # Initialize voted structure if it doesn't exist
+        voted = movie.get('voted', {})
+        if emoji_type not in voted:
+            voted[emoji_type] = []
+
+        # Add user to the emoji vote list
+        voted[emoji_type].append(f"@{user_id}")
 
         # Record the vote in the votes index
         vote_obj = {
             'objectID': f"vote_{user_token[:8]}_{movie_id}_{int(time.time())}_{random.randint(0, 9999):04d}",
             'userToken': user_token,
             'movieId': movie_id,
+            'emoji': emoji_type,
             'timestamp': int(time.time())
         }
 
         votes_index.save_object(vote_obj)
-        logger.info(f"Recorded vote for movie {movie_id} by user {user_id}.")
+        logger.info(f"Recorded {emoji_type} vote for movie {movie_id} by user {user_id}.")
 
-        # Increment the movie's vote count in the movies index
-        movies_index = client.init_index(movies_index_name)
-
-        logger.info(f"Sending increment task for movie {movie_id}.")
+        # Update the movie's voted structure
+        movies_index = search_client.init_index(movies_index_name)
+        
+        logger.info(f"Updating vote structure for movie {movie_id}.")
         update_result = movies_index.partial_update_object({
             'objectID': movie_id,
-            'votes': {
-                '_operation': 'Increment',
-                'value': 1
-            }
+            'voted': voted
         })
 
-        # Fixed: V3 API returns a dict directly, not a response object
+        # Wait for the task to complete
         if isinstance(update_result, dict) and 'taskID' in update_result:
             task_id = update_result['taskID']
-        else:
-            # Handle different response format
-            task_id = getattr(update_result, 'raw_responses', {}).get('taskID', None)
-            if task_id is None:
-                logger.error(f"Could not find taskID in update_result: {update_result}")
-                # Try to get the movie anyway
-                updated_movie = await get_movie_by_id(client, movies_index_name, movie_id)
-                if updated_movie:
-                    return True, updated_movie
-                return True, {'objectID': movie_id, 'votes': 'Unknown', 'title': 'Unknown Movie', 'image': None}
-
-        # V3 API: Wait for task using index method
-        movies_index.wait_task(task_id)
-        logger.info(f"Algolia task {task_id} completed for index {movies_index_name}.")
+            movies_index.wait_task(task_id)
+            logger.info(f"Algolia task {task_id} completed for index {movies_index_name}.")
 
         # Fetch the updated movie object
-        updated_movie = await get_movie_by_id(client, movies_index_name, movie_id)
+        updated_movie = await get_movie_by_id(search_client, movies_index_name, movie_id)
         if updated_movie:
-            logger.info(f"Fetched updated movie {movie_id}. New vote count: {updated_movie.get('votes', 0)}")
+            # Calculate total votes from voted structure
+            total_votes = sum(len(users) for users in updated_movie.get('voted', {}).values())
+            updated_movie['votes'] = total_votes  # For backward compatibility
+            logger.info(f"Fetched updated movie {movie_id}. New vote count: {total_votes}")
             return True, updated_movie
         else:
-            logger.error(f"Vote recorded for {movie_id}, but failed to fetch updated movie object after waiting.")
+            logger.error(f"Vote recorded for {movie_id}, but failed to fetch updated movie object.")
             return True, {'objectID': movie_id, 'votes': 'Unknown', 'title': 'Unknown Movie', 'image': None}
 
     except Exception as e:
         logger.error(f"FATAL error voting for movie {movie_id} by user {user_id}: {e}", exc_info=True)
         return False, str(e)
-
 
 async def get_movie_by_id(client: SearchClient, index_name: str, movie_id: str) -> Optional[Dict[str, Any]]:
     """Get a movie by its ID from Algolia movies index."""
@@ -273,22 +279,36 @@ async def search_movies_for_vote(client: SearchClient, index_name: str, title: s
         logger.error(f"Error searching for movies for vote '{title}' in Algolia: {e}", exc_info=True)
         return {'hits': [], 'nbHits': 0}
 
-
 async def get_top_movies(client: SearchClient, index_name: str, count: int = 5) -> List[Dict[str, Any]]:
     """Get the top voted movies from Algolia movies index - only movies with 1+ votes."""
     try:
         index = client.init_index(index_name)
-
+        
+        # Get all movies with voted data
         search_response = index.search('', {
-            'filters': 'votes > 0',  # Only movies with at least 1 vote
-            'hitsPerPage': count,
+            'filters': 'voted:*',  # Movies that have any votes
+            'hitsPerPage': 1000,   # Get many to sort in Python
             'attributesToRetrieve': [
                 'objectID', 'title', 'year', 'director',
-                'actors', 'genre', 'image', 'votes', 'plot', 'rating'
+                'actors', 'genre', 'image', 'voted', 'plot'
             ]
         })
-
-        return search_response.get('hits', [])
+        
+        movies = search_response.get('hits', [])
+        
+        # Calculate total votes for each movie and filter out unvoted
+        movies_with_votes = []
+        for movie in movies:
+            voted = movie.get('voted', {})
+            total_votes = sum(len(users) for users in voted.values())
+            if total_votes > 0:
+                movie['votes'] = total_votes  # Add calculated votes
+                movies_with_votes.append(movie)
+        
+        # Sort by vote count
+        movies_with_votes.sort(key=lambda m: m['votes'], reverse=True)
+        
+        return movies_with_votes[:count]
 
     except Exception as e:
         logger.error(f"Error getting top {count} movies from Algolia: {e}", exc_info=True)

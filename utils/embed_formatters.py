@@ -13,75 +13,72 @@ logger = logging.getLogger("paradiso_bot")
 def format_movie_embed(movie: Dict[str, Any], title_prefix: str = "") -> discord.Embed:
     """
     Format a movie object into a Discord embed.
-
-    Args:
-        movie: Movie dictionary with details
-        title_prefix: Prefix to add to the title
-
-    Returns:
-        Discord embed with movie information
     """
     # Extract basic information
     title = movie.get("title", "Unknown")
-    year = f" ({movie.get('year')})" if movie.get('year') is not None else ""
-    votes = movie.get("votes", 0)
-    rating = movie.get("rating")
+    year = movie.get('year')
+    voted = movie.get("voted", {})
     director = movie.get("director")
+    actors = movie.get("actors", [])
     genre = movie.get("genre", [])
     plot = movie.get("plot")
     image = movie.get("image")
-
-    # Create embed with optional title prefix
-    embed_title = f"{title_prefix}{title}{year}" if title else f"{title_prefix}Unknown Movie"
+    
+    # Calculate total votes from voted structure
+    total_votes = sum(len(users) for users in voted.values())
+    
+    # Create embed with year always displayed
+    embed_title = f"{title_prefix}{title}"
+    if year:
+        embed_title += f" ({year})"
+    
     embed = discord.Embed(
         title=embed_title,
         color=0x00ff00
     )
-
+    
     # Add description if there's a plot
     if plot:
-        # Truncate long plots
         if len(plot) > 200:
             plot = plot[:197] + "..."
         embed.description = plot
-
+    
     # Set thumbnail if available
     if image:
         embed.set_thumbnail(url=image)
-
-    # Add director
+    
+    # Add director when present
     if director and director != "Unknown":
         embed.add_field(name="Director", value=director, inline=True)
-
-    # Add rating
-    if rating is not None:
-        embed.add_field(name="Rating", value=f"⭐ {rating}/10", inline=True)
-
-    # Add votes
-    embed.add_field(name="Votes", value=f"🗳️ {votes}", inline=True)
-
-    # Add genres
+    
+    # Add actors when present
+    if actors:
+        actors_str = ", ".join(actors[:3])  # Show first 3 actors
+        if len(actors) > 3:
+            actors_str += "..."
+        embed.add_field(name="Actors", value=actors_str, inline=True)
+    
+    # Add year if not already in title
+    if not year:
+        embed.add_field(name="Year", value="Unknown", inline=True)
+    
+    # Add vote count
+    embed.add_field(name="Votes", value=f"👍 {total_votes}", inline=True)
+    
+    # Add genres or "Autre"
     if genre:
-        embed.add_field(name="Genres", value=", ".join(genre), inline=True)
-
+        embed.add_field(name="Genre", value=", ".join(genre), inline=False)
+    else:
+        embed.add_field(name="Genre", value="Autre", inline=False)
+    
     return embed
-
-
 async def send_search_results_embed(
     channel: Union[discord.Webhook, discord.abc.Messageable],
     query: str,
     results: List[Dict[str, Any]],
     total_count: int
 ) -> None:
-    """
-    Format and send search results as an embed.
-    
-    Args:
-        channel: Channel or webhook to send to
-        query: Original search query
-        results: List of search result objects
-        total_count: Total number of hits
-    """
+    """Format and send search results as an embed."""
     if not results:
         embed = discord.Embed(
             title=f"No results for '{query}'",
@@ -101,61 +98,47 @@ async def send_search_results_embed(
     if results and results[0].get("image"):
         embed.set_thumbnail(url=results[0]["image"])
     
-    for i, movie in enumerate(results[:10]):  # Limit to 10 results
+    for i, movie in enumerate(results[:10]):
         # Extract basic information
         title = movie.get("title", "Unknown")
-        year = f" ({movie.get('year')})" if movie.get('year') is not None else ""
-        votes = movie.get("votes", 0)
+        year = movie.get('year')
+        voted = movie.get("voted", {})
         
-        # Extract highlights if available
-        highlights = []
-        if movie.get("_highlightResult"):
-            highlight_result = movie["_highlightResult"]
-            
-            for field in ["director", "actors", "genre"]:
-                if field in highlight_result:
-                    if isinstance(highlight_result[field], list):
-                        # Handle array fields like actors, genre
-                        highlighted_items = [h["value"] for h in highlight_result[field] if h.get("matchLevel") != "none"]
-                        if highlighted_items:
-                            field_name = field.capitalize()
-                            highlights.append(f"**{field_name}**: {', '.join(highlighted_items[:3])}")
-                    elif highlight_result[field].get("matchLevel") != "none":
-                        # Handle string fields like director
-                        field_name = field.capitalize()
-                        highlights.append(f"**{field_name}**: {highlight_result[field]['value']}")
+        # Calculate total votes
+        total_votes = sum(len(users) for users in voted.values())
         
-        # Extract snippet if available
+        # Format the movie details
+        details = [f"**Votes**: 👍 {total_votes}"]
+        
+        # Add year if available
+        if year:
+            details.append(f"**Year**: {year}")
+        
+        # Add director if available
+        if movie.get("director") and movie.get("director") != "Unknown":
+            details.append(f"**Director**: {movie['director']}")
+        
+        # Add actors if available
+        if movie.get("actors"):
+            actors_str = ", ".join(movie['actors'][:2])
+            if len(movie['actors']) > 2:
+                actors_str += "..."
+            details.append(f"**Actors**: {actors_str}")
+        
+        # Add snippet if available
         snippet = None
         if movie.get("_snippetResult") and movie["_snippetResult"].get("plot"):
             snippet = movie["_snippetResult"]["plot"]["value"]
-        
-        # Format the movie details
-        details = [f"**Votes**: {votes}"]
-        
-        # Add year and rating if available
-        if movie.get("year"):
-            details.append(f"**Year**: {movie.get('year')}")
-        if movie.get("rating"):
-            details.append(f"**Rating**: ⭐ {movie.get('rating')}/10")
-        
-        # Add highlighted fields
-        details.extend(highlights)
-        
-        # Add snippet if available
-        if snippet:
             details.append(f"**Plot**: {snippet}")
         
         embed.add_field(
-            name=f"{i+1}. {title}{year}",
+            name=f"{i+1}. {title}",
             value="\n".join(details),
             inline=False
         )
     
     embed.set_footer(text="Use /vote [title] to vote for a movie or /info [title] for more details.")
-    
     await channel.send(embed=embed)
-
 
 async def send_detailed_movie_embed(
     channel: Union[discord.Webhook, discord.abc.Messageable],
