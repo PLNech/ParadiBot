@@ -1,18 +1,72 @@
 """
 UI Modal components for Paradiso Discord Bot
-Includes modals for adding movies.
+Includes modals and confirmation views for adding movies.
 """
 
 import logging
 import time
 import discord
-from discord.ui import Modal, TextInput
-from typing import Dict, Any, Optional
+from discord.ui import Modal, TextInput, View, Button
+from typing import Dict, Any, Optional, List
 
 from utils.algolia_utils import add_movie_to_algolia, _check_movie_exists, generate_user_token
 from utils.embed_formatters import format_movie_embed
 
 logger = logging.getLogger("paradiso_bot")
+
+class MovieAddConfirmView(View):
+    """View for confirming movie addition when similar movies exist."""
+
+    def __init__(self, bot_instance, movie_data: Dict[str, Any], existing_movies: List[Dict[str, Any]], interaction: discord.Interaction):
+        super().__init__(timeout=60)
+        self.bot = bot_instance
+        self.movie_data = movie_data
+        self.existing_movies = existing_movies
+        self.original_interaction = interaction
+
+    @discord.ui.button(label="Add Anyway", style=discord.ButtonStyle.green)
+    async def add_anyway(self, interaction: discord.Interaction, button: Button):
+        """Add the movie despite similar entries."""
+        try:
+            # Add to Algolia
+            await add_movie_to_algolia(self.bot.algolia_client, self.bot.algolia_movies_index_name, self.movie_data)
+
+            # Create response embed
+            embed = format_movie_embed(self.movie_data, title_prefix=f"🎬 Added: ")
+            embed.set_footer(text=f"Added by {interaction.user.display_name}")
+
+            # Disable all buttons
+            for item in self.children:
+                item.disabled = True
+
+            await interaction.response.edit_message(
+                content="✅ Movie added to the voting queue!",
+                embed=embed,
+                view=self
+            )
+
+            logger.info(f"Force-added movie via modal: {self.movie_data['title']} ({self.movie_data['objectID']})")
+
+        except Exception as e:
+            logger.error(f"Error force-adding movie via modal: {e}", exc_info=True)
+            await interaction.response.send_message(
+                f"❌ An error occurred while adding the movie: {str(e)}",
+                ephemeral=True
+            )
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.red)
+    async def cancel_add(self, interaction: discord.Interaction, button: Button):
+        """Cancel the movie addition."""
+        # Disable all buttons
+        for item in self.children:
+            item.disabled = True
+
+        await interaction.response.edit_message(
+            content="❌ Movie addition cancelled.",
+            embed=None,
+            view=self
+        )
+
 
 class MovieAddModal(Modal, title="Add Movie to Paradiso"):
     """
@@ -96,15 +150,29 @@ class MovieAddModal(Modal, title="Add Movie to Paradiso"):
             actors = [a.strip() for a in self.actors_input.value.split(',') if a.strip()] if self.actors_input.value else []
             genres = [g.strip() for g in self.genre_input.value.split(',') if g.strip()] if self.genre_input.value else []
 
-            # Check if the movie already exists
-            existing_movie = await _check_movie_exists(self.bot.algolia_client, self.bot.algolia_movies_index_name, title)
+            # Check if the movie already exists (exact title+year match)
+            existing_movie = await _check_movie_exists(self.bot.algolia_client, self.bot.algolia_movies_index_name, title, year)
 
             if existing_movie:
                 await interaction.followup.send(
-                    f"❌ A movie with a similar title is already in the voting queue: '{existing_movie['title']}'",
+                    f"❌ This exact movie (title and year) is already in the voting queue: '{existing_movie['title']}' ({existing_movie.get('year', 'N/A')})",
                     ephemeral=True
                 )
                 return
+
+            # Check for similar movies (title only, fuzzy match)
+            index = self.bot.algolia_client.init_index(self.bot.algolia_movies_index_name)
+            search_response = index.search(title, {
+                'hitsPerPage': 3,
+                'attributesToRetrieve': ['objectID', 'title', 'year', 'votes'],
+                'typoTolerance': 'min'
+            })
+
+            # Filter for similar movies (same title, different or no year)
+            similar_movies = []
+            for hit in search_response.get('hits', []):
+                if hit.get('title', '').lower() == title.lower() and hit.get('year') != year:
+                    similar_movies.append(hit)
 
             # Prepare movie data
             movie_data = {
@@ -127,20 +195,38 @@ class MovieAddModal(Modal, title="Add Movie to Paradiso"):
                 'voted': False
             }
 
-            # Add to Algolia
-            await add_movie_to_algolia(self.bot.algolia_client, self.bot.algolia_movies_index_name, movie_data)
+            # If there are similar movies, show confirmation
+            if similar_movies:
+                embed = discord.Embed(
+                    title="⚠️ Similar movies found",
+                    description=f"Found movies with the same title. Do you still want to add '{title}' ({year or 'N/A'})?",
+                    color=0xFFA500
+                )
 
-            # Create response embed
-            embed = format_movie_embed(movie_data, title_prefix=f"🎬 Added: ")
-            embed.set_footer(text=f"Added by {interaction.user.display_name}")
-            
-            # Send confirmation
-            await interaction.followup.send(
-                "✅ Movie added to the voting queue!",
-                embed=embed
-            )
-            
-            logger.info(f"Added movie via modal: {title} ({movie_data['objectID']})")
+                for i, movie in enumerate(similar_movies):
+                    embed.add_field(
+                        name=f"{i+1}. {movie['title']} ({movie.get('year', 'N/A')})",
+                        value=f"Votes: {movie.get('votes', 0)}",
+                        inline=False
+                    )
+
+                view = MovieAddConfirmView(self.bot, movie_data, similar_movies, interaction)
+                await interaction.followup.send(embed=embed, view=view)
+            else:
+                # No similar movies, add directly
+                await add_movie_to_algolia(self.bot.algolia_client, self.bot.algolia_movies_index_name, movie_data)
+
+                # Create response embed
+                embed = format_movie_embed(movie_data, title_prefix=f"🎬 Added: ")
+                embed.set_footer(text=f"Added by {interaction.user.display_name}")
+
+                # Send confirmation
+                await interaction.followup.send(
+                    "✅ Movie added to the voting queue!",
+                    embed=embed
+                )
+
+                logger.info(f"Added movie via modal: {title} ({movie_data['objectID']})")
         
         except Exception as e:
             logger.error(f"Error adding movie via modal: {e}", exc_info=True)

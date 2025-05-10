@@ -29,36 +29,40 @@ def _is_float(value: Any) -> bool:
 
 
 # Algolia interaction methods using v3 API structure
-async def _check_movie_exists(client: SearchClient, index_name: str, title: str) -> Optional[Dict[str, Any]]:
+async def _check_movie_exists(client: SearchClient, index_name: str, title: str, year: Optional[int] = None) -> \
+Optional[Dict[str, Any]]:
     """
-    Checks if a movie with a similar title already exists in Algolia.
-    Uses search and checks for strong matches.
+    Checks if a movie with the same title and year already exists in Algolia.
+    Only exact title+year matches are considered conflicts.
     """
     if not title:
         return None
     try:
         index = client.init_index(index_name)
 
+        # Build filter for exact match
+        filters = []
+        if year is not None:
+            filters.append(f"year:{year}")
+
         search_response = index.search(title, {
             'hitsPerPage': 5,
-            'attributesToRetrieve': ['objectID', 'title'],
-            'attributesToHighlight': ['title'],
-            'typoTolerance': 'strict'
+            'attributesToRetrieve': ['objectID', 'title', 'year'],
+            'typoTolerance': 'strict',
+            'filters': ' AND '.join(filters) if filters else None
         })
 
         if not search_response or search_response.get('nbHits', 0) == 0:
             return None
 
+        # Check for exact title and year match
         for hit in search_response.get('hits', []):
-            title_highlight = hit.get('_highlightResult', {}).get('title', {})
-            if title_highlight.get('matchLevel') == 'full':
-                logger.info(f"Existing movie check: Found full title match for '{title}': {hit['objectID']}")
-                return hit
             if hit.get('title', '').lower() == title.lower():
-                logger.info(f"Existing movie check: Found exact string match for '{title}': {hit['objectID']}")
-                return hit
+                if year is None or hit.get('year') == year:
+                    logger.info(f"Existing movie check: Found exact match for '{title}' ({year}): {hit['objectID']}")
+                    return hit
 
-        logger.info(f"Existing movie check: No strong title match for '{title}' among top hits.")
+        logger.info(f"Existing movie check: No exact match for '{title}' ({year}).")
         return None
 
     except Exception as e:
@@ -140,9 +144,23 @@ async def vote_for_movie(client: SearchClient, movies_index_name: str, votes_ind
             }
         })
 
+        # Fixed: V3 API returns a dict directly, not a response object
+        if isinstance(update_result, dict) and 'taskID' in update_result:
+            task_id = update_result['taskID']
+        else:
+            # Handle different response format
+            task_id = getattr(update_result, 'raw_responses', {}).get('taskID', None)
+            if task_id is None:
+                logger.error(f"Could not find taskID in update_result: {update_result}")
+                # Try to get the movie anyway
+                updated_movie = await get_movie_by_id(client, movies_index_name, movie_id)
+                if updated_movie:
+                    return True, updated_movie
+                return True, {'objectID': movie_id, 'votes': 'Unknown', 'title': 'Unknown Movie', 'image': None}
+
         # V3 API: Wait for task using index method
-        movies_index.wait_task(update_result['taskID'])
-        logger.info(f"Algolia task {update_result['taskID']} completed for index {movies_index_name}.")
+        movies_index.wait_task(task_id)
+        logger.info(f"Algolia task {task_id} completed for index {movies_index_name}.")
 
         # Fetch the updated movie object
         updated_movie = await get_movie_by_id(client, movies_index_name, movie_id)
@@ -150,8 +168,7 @@ async def vote_for_movie(client: SearchClient, movies_index_name: str, votes_ind
             logger.info(f"Fetched updated movie {movie_id}. New vote count: {updated_movie.get('votes', 0)}")
             return True, updated_movie
         else:
-            logger.error(
-                f"Vote recorded for {movie_id}, but failed to fetch updated movie object after waiting.")
+            logger.error(f"Vote recorded for {movie_id}, but failed to fetch updated movie object after waiting.")
             return True, {'objectID': movie_id, 'votes': 'Unknown', 'title': 'Unknown Movie', 'image': None}
 
     except Exception as e:
@@ -257,11 +274,12 @@ async def search_movies_for_vote(client: SearchClient, index_name: str, title: s
 
 
 async def get_top_movies(client: SearchClient, index_name: str, count: int = 5) -> List[Dict[str, Any]]:
-    """Get the top voted movies from Algolia movies index."""
+    """Get the top voted movies from Algolia movies index - only movies with 1+ votes."""
     try:
         index = client.init_index(index_name)
 
         search_response = index.search('', {
+            'filters': 'votes > 0',  # Only movies with at least 1 vote
             'hitsPerPage': count,
             'attributesToRetrieve': [
                 'objectID', 'title', 'year', 'director',
@@ -311,3 +329,78 @@ async def get_all_movies(client: SearchClient, index_name: str) -> List[Dict[str
             logger.error(f"Fallback search also failed: {fallback_e}", exc_info=True)
 
         return []
+
+
+async def get_random_movie(client: SearchClient, index_name: str, last_shown: List[str] = None) -> Optional[
+    Dict[str, Any]]:
+    """Get a random movie from all movies, avoiding recently shown ones."""
+    try:
+        index = client.init_index(index_name)
+        last_shown = last_shown or []
+
+        # First, get total count of movies
+        count_response = index.search('', {
+            'hitsPerPage': 0,
+            'analytics': False
+        })
+
+        total_movies = count_response.get('nbHits', 0)
+        if total_movies == 0:
+            return None
+
+        # If we've shown too many movies recently, reset the history
+        if len(last_shown) >= min(50, total_movies):
+            last_shown = []
+
+        # Get a random page of movies
+        random_page = random.randint(0, total_movies - 1)
+
+        movie_response = index.search('', {
+            'hitsPerPage': 1,
+            'page': random_page,
+            'attributesToRetrieve': ['*', 'objectID']
+        })
+
+        if not movie_response.get('hits'):
+            # Fallback: try browsing if search fails
+            all_movies = []
+            for hit in index.browse_objects():
+                all_movies.append(hit)
+                if len(all_movies) >= 100:  # Limit to 100 for performance
+                    break
+
+            if all_movies:
+                # Filter out recently shown
+                available_movies = [m for m in all_movies if m['objectID'] not in last_shown]
+                if available_movies:
+                    return random.choice(available_movies)
+                else:
+                    # If all are shown, return any random one
+                    return random.choice(all_movies)
+
+            return None
+
+        random_movie = movie_response['hits'][0]
+
+        # Check if this movie was recently shown
+        if random_movie['objectID'] in last_shown:
+            # Try to get another one
+            for attempt in range(5):  # Max 5 attempts
+                random_page = random.randint(0, total_movies - 1)
+                movie_response = index.search('', {
+                    'hitsPerPage': 1,
+                    'page': random_page,
+                    'attributesToRetrieve': ['*', 'objectID']
+                })
+
+                if movie_response.get('hits') and movie_response['hits'][0]['objectID'] not in last_shown:
+                    return movie_response['hits'][0]
+
+            # If we couldn't find a non-shown movie, return the original one
+            return random_movie
+
+        return random_movie
+
+    except Exception as e:
+        logger.error(f"Error getting random movie: {e}", exc_info=True)
+        return None
