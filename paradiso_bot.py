@@ -20,6 +20,7 @@ from typing import List, Dict, Any, Optional, Union
 
 import discord
 from algoliasearch.search_client import SearchClient
+from algoliasearch.recommend_client import RecommendClient
 from discord import app_commands
 from dotenv import load_dotenv
 
@@ -80,6 +81,7 @@ class ParadisoBot:
 
         # V3 API: Simple client initialization
         self.algolia_client = SearchClient.create(algolia_app_id, algolia_api_key)
+        self.recommend_client = RecommendClient.create(algolia_app_id, algolia_api_key)
 
         self._setup_event_handlers()
         self._register_commands()
@@ -753,7 +755,8 @@ class ParadisoBot:
 
             # Get recommendations using Algolia's related-products model
             recommendations = await get_recommendations(
-                self.algolia_client,
+                self.algolia_client,  # Search client
+                self.recommend_client,  # Recommend client
                 self.algolia_movies_index_name,
                 reference_movie['objectID'],
                 model="related",
@@ -824,7 +827,8 @@ class ParadisoBot:
 
             # Get visually similar movies using Algolia's looking-similar model
             similar_movies = await get_recommendations(
-                self.algolia_client,
+                self.algolia_client,  # Search client
+                self.recommend_client,  # Recommend client
                 self.algolia_movies_index_name,
                 reference_movie['objectID'],
                 model="similar",
