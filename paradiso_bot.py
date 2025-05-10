@@ -115,6 +115,53 @@ class ParadisoBot:
                 logger.error(f"Error syncing commands: {e}", exc_info=True)
 
         @self.client.event
+        async def on_reaction_add(reaction, user):
+            """Handle emoji reactions to movie messages."""
+            if user == self.client.user:
+                return
+            
+            # Check if this is a movie message (you might want to track these)
+            # For now, we'll assume any message with embeds containing movie info
+            if reaction.message.embeds:
+                embed = reaction.message.embeds[0]
+                
+                # Extract movie ID from embed footer (if present)
+                if embed.footer and "ID: " in embed.footer.text:
+                    try:
+                        movie_id = embed.footer.text.split("ID: ")[1].split(" ")[0]
+                        
+                        # Map Discord emoji to our vote types
+                        emoji_mapping = {
+                            "👍": "thumb_up",
+                            "👎": "thumb_down",
+                            "❤️": "love",
+                            "😂": "laugh",
+                            "😮": "surprise",
+                            "😢": "sad",
+                            "💩": "poop"
+                        }
+                        
+                        emoji_str = str(reaction.emoji)
+                        if emoji_str in emoji_mapping:
+                            emoji_type = emoji_mapping[emoji_str]
+                            
+                            # Record the vote
+                            success, result = await vote_for_movie(
+                                self.algolia_client,
+                                self.algolia_movies_index_name,
+                                self.algolia_votes_index_name,
+                                movie_id,
+                                str(user.id),
+                                emoji_type
+                            )
+                            
+                            if success:
+                                # Optionally notify the user
+                                pass
+                    except Exception as e:
+                        logger.error(f"Error processing emoji reaction: {e}")
+
+        @self.client.event
         async def on_message(message):
             if message.author == self.client.user:
                 return
@@ -568,7 +615,7 @@ class ParadisoBot:
                 if len(self.last_random_movies) > 50:
                     self.last_random_movies = self.last_random_movies[-50:]
 
-            embed = format_movie_embed(random_movie, title_prefix="🎲 Random Movie:")
+            embed = format_movie_embed(random_movie, title_prefix="🎲")
             embed.add_field(name="Votes", value=str(random_movie.get("votes", 0)), inline=True)
             if random_movie.get("votes", 0) == 0:
                 embed.set_footer(text="This movie has no votes yet! Why not be the first?")
@@ -629,6 +676,44 @@ class ParadisoBot:
                 del self.pending_votes[user_id]
 
     # --- Slash Command Handlers ---
+    async def cmd_vote(self, interaction: discord.Interaction, title: str):
+        await interaction.response.defer(thinking=True)
+        user_id = interaction.user.id
+        try:
+            search_results_dict = await search_movies_for_vote(self.algolia_client, self.algolia_movies_index_name, title)
+            if search_results_dict["nbHits"] == 0:
+                await interaction.followup.send(f"❌ No movies matching '{title}'. Use `/movies` or `/search`.")
+                return
+
+            hits = search_results_dict["hits"]
+            if search_results_dict["nbHits"] == 1:
+                movie_to_vote = hits[0]
+                success, result = await vote_for_movie(self.algolia_client, self.algolia_movies_index_name,
+                                                    self.algolia_votes_index_name, movie_to_vote["objectID"],
+                                                    str(user_id), emoji_type="thumb_up")  # Default to thumb_up
+                if success:
+                    embed = format_movie_embed(result, title_prefix=f"✅ Vote recorded for: {result['title']}")
+                    embed.description = f"Your 👍 vote has been recorded!"
+                    await interaction.followup.send(embed=embed)
+                else:
+                    await interaction.followup.send(f"❌ {result}" if isinstance(result, str) else "❌ Error voting.")
+            else:
+                choices = hits[:5]
+                embed = discord.Embed(title=f"Multiple movies for '{title}'",
+                                    description="Select the movie to vote for:", color=0xffa500)
+                choice_list_desc = []
+                for i, m in enumerate(choices):
+                    voted = m.get('voted', {})
+                    total_votes = sum(len(users) for users in voted.values())
+                    choice_list_desc.append(f"{i + 1}. {m.get('title', 'N/A')} ({m.get('year', 'N/A')}) - Votes: 👍 {total_votes}")
+                embed.add_field(name="Choices", value="\n".join(choice_list_desc), inline=False)
+                view = VoteSelectionView(self, user_id, choices)
+                message = await interaction.followup.send(embed=embed, view=view)
+                self.vote_messages[message.id] = {'user_id': user_id, 'choices': choices}
+                view.message = message
+        except Exception as e:
+            logger.error(f"Error in /vote for '{title}': {e}", exc_info=True)
+            await interaction.followup.send(f"❌ Error searching: {str(e)}")
 
     async def cmd_vote(self, interaction: discord.Interaction, title: str):
         await interaction.response.defer(thinking=True)
@@ -924,7 +1009,7 @@ class ParadisoBot:
                 if len(self.last_random_movies) > 50:
                     self.last_random_movies = self.last_random_movies[-50:]
 
-            embed = format_movie_embed(random_movie, title_prefix="🎲 Random Movie:")
+            embed = format_movie_embed(random_movie, title_prefix="🎲")
             embed.add_field(name="Votes", value=str(random_movie.get("votes", 0)), inline=True)
             if random_movie.get("votes", 0) == 0:
                 embed.set_footer(text="This movie has no votes yet! Why not be the first?")

@@ -101,8 +101,9 @@ async def add_movie_to_algolia(client: SearchClient, index_name: str, movie_data
             'voted': movie_data.get('voted', False)
         }
 
-        # V3 API: Simple save_object call
-        index.save_object(processed_data)
+        res = index.save_object(processed_data)
+        task_id = res.get('taskID')
+        index.wait_task(task_id)
         logger.info(f"Added movie to Algolia: {processed_data.get('title')} ({processed_data.get('objectID')})")
     except Exception as e:
         logger.error(f"Error adding movie to Algolia: {e}", exc_info=True)
@@ -149,7 +150,9 @@ async def vote_for_movie(search_client: SearchClient, movies_index_name: str, vo
             'timestamp': int(time.time())
         }
 
-        votes_index.save_object(vote_obj)
+        res = votes_index.save_object(vote_obj)
+        task_id = res.get('taskID')
+        votes_index.wait_task(task_id)
         logger.info(f"Recorded {emoji_type} vote for movie {movie_id} by user {user_id}.")
 
         # Update the movie's voted structure
